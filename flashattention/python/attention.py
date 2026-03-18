@@ -164,11 +164,11 @@ def benchmark_attention(
     """
     results = {}
 
-    # Move to GPU if available
+    # Move to GPU if available and convert to float16
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    Q = Q.to(device)
-    K = K.to(device)
-    V = V.to(device)
+    Q = Q.to(device=device, dtype=torch.float16)
+    K = K.to(device=device, dtype=torch.float16)
+    V = V.to(device=device, dtype=torch.float16)
 
     # Warmup
     if use_pytorch:
@@ -292,6 +292,7 @@ def run_correctness_test(
 
     all_passed = True
     reference = None
+    use_pytorch = True  # Always use PyTorch as reference
 
     # Get reference (PyTorch)
     if use_pytorch:

@@ -6,10 +6,11 @@
 #include <algorithm>
 
 // Minimal FlashAttention v2 - Debug version
+// Supports any head dimension D up to 128
 
 constexpr int BLOCK_N = 64;
-constexpr int BLOCK_D = 64;
 constexpr int THREADS = 128;
+constexpr int MAX_D = 128;  // Maximum supported head dimension
 constexpr float NEG_INF = -1e10f;
 
 struct FlashAttentionParams {
@@ -53,7 +54,7 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
     }
 
     // Output for this Q row
-    float output[BLOCK_D] = {0.0f};
+    float output[MAX_D] = {0.0f};
     float max_val = NEG_INF;
     float sum_val = 0.0f;
 
@@ -142,8 +143,8 @@ torch::Tensor flash_attention_fwd(torch::Tensor Q, torch::Tensor K, torch::Tenso
 
     dim3 grid(N, H, B);
     dim3 block(THREADS);
-    // Q + K + V blocks
-    size_t shared_mem = (p.D + 2 * BLOCK_N * BLOCK_D) * sizeof(float);
+    // Q + K + V blocks: D + BLOCK_N * D + BLOCK_N * D
+    size_t shared_mem = (D + 2 * BLOCK_N * D) * sizeof(float);
 
     flash_attention_fwd_kernel<<<grid, block, shared_mem, at::cuda::getCurrentCUDAStream()>>>(params);
     cudaError_t err = cudaGetLastError();
