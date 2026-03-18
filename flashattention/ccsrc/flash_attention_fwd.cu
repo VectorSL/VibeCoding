@@ -5,7 +5,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <algorithm>
 
-// FlashAttention v2 - Stable version with correctness fixes
+// FlashAttention v2 - Larger block size for better efficiency
 
 constexpr int BLOCK_N = 64;
 constexpr int THREADS = 128;
@@ -21,7 +21,6 @@ struct FlashAttentionParams {
     float softmax_scale;
 };
 
-// Main kernel - one block per Q row
 __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
     const int batch_idx = blockIdx.z;
     const int head_idx = blockIdx.y;
@@ -40,13 +39,11 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
     const int q_base = batch_idx * q_stride + head_idx * head_stride_q;
     const int k_base = batch_idx * k_stride + head_idx * head_stride_k;
 
-    // Shared memory: Q + K + V
     extern __shared__ float sram[];
     float* sram_Q = sram;
     float* sram_K = sram + p.D;
     float* sram_V = sram + p.D + BLOCK_N * p.D;
 
-    // Load Q row
     for (int d = tid; d < p.D; d += num_threads) {
         sram_Q[d] = __half2float(p.Q[q_base + q_row * p.D + d]);
     }
@@ -61,7 +58,7 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         const int kv_start = kv_block * BLOCK_N;
         const int kv_len = min(BLOCK_N, p.M - kv_start);
 
-        // Load K block
+        // Load K
         for (int j = tid; j < kv_len * p.D; j += num_threads) {
             int kj = j / p.D;
             int dk = j % p.D;
@@ -71,7 +68,7 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
             }
         }
 
-        // Load V block
+        // Load V
         for (int j = tid; j < kv_len * p.D; j += num_threads) {
             int vj = j / p.D;
             int dv = j % p.D;
@@ -82,7 +79,7 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         }
         __syncthreads();
 
-        // Compute attention for this block
+        // Compute attention
         for (int kj = 0; kj < kv_len; kj++) {
             float score = 0.0f;
             for (int d = 0; d < p.D; d++) {
@@ -90,12 +87,10 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
             }
             score *= p.softmax_scale;
 
-            // Online softmax
             float new_max = fmaxf(max_val, score);
             float exp_score = expf(score - new_max);
             float exp_max = expf(max_val - new_max);
 
-            // Update output
             for (int d = 0; d < p.D; d++) {
                 output[d] = output[d] * exp_max + exp_score * sram_V[kj * p.D + d];
             }
@@ -107,7 +102,6 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         __syncthreads();
     }
 
-    // Write output
     const int o_offset = q_base + q_row * p.D;
     for (int d = tid; d < p.D; d += num_threads) {
         float val = (sum_val > 0) ? output[d] / sum_val : 0.0f;
@@ -135,7 +129,6 @@ torch::Tensor flash_attention_fwd(torch::Tensor Q, torch::Tensor K, torch::Tenso
     params.B = B; params.H = H; params.N = N; params.M = M; params.D = D;
     params.softmax_scale = scale;
 
-    // Launch: one block per Q row
     dim3 grid(N, H, B);
     dim3 block(THREADS);
     size_t shared_mem = (D + 2 * BLOCK_N * D) * sizeof(float);
