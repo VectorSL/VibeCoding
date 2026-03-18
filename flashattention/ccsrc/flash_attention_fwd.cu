@@ -5,10 +5,11 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <algorithm>
 
-// FlashAttention v2 - Larger block size for better efficiency
+// FlashAttention v2 - Multiple Q rows per block for better parallelism
 
 constexpr int BLOCK_N = 64;
-constexpr int THREADS = 128;
+constexpr int BLOCK_M = 8;   // Process 8 Q rows per block
+constexpr int THREADS = 256;
 constexpr int MAX_D = 128;
 constexpr float NEG_INF = -1e10f;
 
@@ -22,6 +23,115 @@ struct FlashAttentionParams {
 };
 
 __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
+    const int batch_idx = blockIdx.z;
+    const int head_idx = blockIdx.y;
+    const int q_start = blockIdx.x * BLOCK_M;
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane_id = tid & 31;
+    const int num_warps = THREADS >> 5;
+
+    extern __shared__ float sram[];
+    float* sram_K = sram;
+    float* sram_V = sram + BLOCK_N * p.D;
+
+    const int q_stride = p.H * p.N * p.D;
+    const int k_stride = p.H * p.M * p.D;
+    const int head_stride_q = p.N * p.D;
+    const int head_stride_k = p.M * p.D;
+
+    const int q_base = batch_idx * q_stride + head_idx * head_stride_q;
+    const int k_base = batch_idx * k_stride + head_idx * head_stride_k;
+
+    const int num_kv_blocks = (p.M + BLOCK_N - 1) / BLOCK_N;
+
+    // Process BLOCK_M Q rows
+    for (int q_local = 0; q_local < BLOCK_M; q_local++) {
+        int q_row = q_start + q_local;
+        if (q_row >= p.N) break;
+
+        // Each warp loads Q row
+        float q_reg[MAX_D];
+        int q_offset = q_base + q_row * p.D;
+        for (int d = lane_id; d < p.D; d += 32) {
+            q_reg[d] = __half2float(p.Q[q_offset + d]);
+        }
+
+        // Initialize
+        float max_val = NEG_INF;
+        float sum_val = 0.0f;
+        float output[MAX_D] = {0.0f};
+
+        // Process all KV blocks
+        for (int kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+            const int kv_start = kv_block * BLOCK_N;
+            const int kv_len = min(BLOCK_N, p.M - kv_start);
+
+            // Load KV - distribute among warps
+            const int kv_per_warp = (kv_len + num_warps - 1) / num_warps;
+            const int my_kv_start = warp_id * kv_per_warp;
+            const int my_kv_len = min(kv_per_warp, kv_len - my_kv_start);
+
+            for (int ki = 0; ki < my_kv_len; ki++) {
+                int kk = my_kv_start + ki;
+                if (kk < kv_len) {
+                    for (int d = lane_id; d < p.D; d += 32) {
+                        sram_K[kk * p.D + d] = __half2float(p.K[k_base + (kv_start + kk) * p.D + d]);
+                        sram_V[kk * p.D + d] = __half2float(p.V[k_base + (kv_start + kk) * p.D + d]);
+                    }
+                }
+            }
+            __syncthreads();
+
+            // Compute attention
+            for (int kj = 0; kj < kv_len; kj++) {
+                float score = 0.0f;
+                for (int d = lane_id; d < p.D; d += 32) {
+                    score += q_reg[d] * sram_K[kj * p.D + d];
+                }
+                // Warp reduce
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    score += __shfl_down_sync(0xffffffff, score, offset);
+                }
+
+                if (lane_id == 0) {
+                    score *= p.softmax_scale;
+
+                    float new_max = fmaxf(max_val, score);
+                    float exp_score = expf(score - new_max);
+                    float exp_max = expf(max_val - new_max);
+
+                    for (int d = 0; d < p.D; d++) {
+                        output[d] = output[d] * exp_max + exp_score * sram_V[kj * p.D + d];
+                    }
+
+                    sum_val = sum_val * exp_max + exp_score;
+                    max_val = new_max;
+                }
+
+                // Sync
+                max_val = __shfl_sync(0xffffffff, max_val, 0);
+                sum_val = __shfl_sync(0xffffffff, sum_val, 0);
+            }
+
+            __syncthreads();
+        }
+
+        // Write output
+        if (lane_id == 0) {
+            int o_offset = q_base + q_row * p.D;
+            for (int d = 0; d < p.D; d++) {
+                float val = (sum_val > 0) ? output[d] / sum_val : 0.0f;
+                p.O[o_offset + d] = __float2half(val);
+            }
+        }
+    }
+}
+
+// Fallback
+__global__ void flash_attention_fwd_kernel_simple(const FlashAttentionParams p) {
     const int batch_idx = blockIdx.z;
     const int head_idx = blockIdx.y;
     const int q_row = blockIdx.x;
@@ -58,7 +168,6 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         const int kv_start = kv_block * BLOCK_N;
         const int kv_len = min(BLOCK_N, p.M - kv_start);
 
-        // Load K
         for (int j = tid; j < kv_len * p.D; j += num_threads) {
             int kj = j / p.D;
             int dk = j % p.D;
@@ -68,7 +177,6 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
             }
         }
 
-        // Load V
         for (int j = tid; j < kv_len * p.D; j += num_threads) {
             int vj = j / p.D;
             int dv = j % p.D;
@@ -79,7 +187,6 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         }
         __syncthreads();
 
-        // Compute attention
         for (int kj = 0; kj < kv_len; kj++) {
             float score = 0.0f;
             for (int d = 0; d < p.D; d++) {
@@ -129,12 +236,23 @@ torch::Tensor flash_attention_fwd(torch::Tensor Q, torch::Tensor K, torch::Tenso
     params.B = B; params.H = H; params.N = N; params.M = M; params.D = D;
     params.softmax_scale = scale;
 
-    dim3 grid(N, H, B);
     dim3 block(THREADS);
-    size_t shared_mem = (D + 2 * BLOCK_N * D) * sizeof(float);
+    size_t shared_mem = (2 * BLOCK_N * D) * sizeof(float);
+
+    // Try optimized: grid size based on BLOCK_M
+    int grid_dim = (N + BLOCK_M - 1) / BLOCK_M;
+    dim3 grid(grid_dim, H, B);
 
     flash_attention_fwd_kernel<<<grid, block, shared_mem, at::cuda::getCurrentCUDAStream()>>>(params);
     cudaError_t err = cudaGetLastError();
+
+    if (err != cudaSuccess) {
+        printf("Kernel error: %s\n", cudaGetErrorString(err));
+        dim3 grid_simple(N, H, B);
+        size_t shared_mem_simple = (D + 2 * BLOCK_N * D) * sizeof(float);
+        flash_attention_fwd_kernel_simple<<<grid_simple, block, shared_mem_simple, at::cuda::getCurrentCUDAStream()>>>(params);
+        err = cudaGetLastError();
+    }
 
     if (err != cudaSuccess) {
         printf("CUDA error: %s\n", cudaGetErrorString(err));
