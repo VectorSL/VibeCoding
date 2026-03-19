@@ -5,13 +5,12 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <algorithm>
 
-// FlashAttention v2 - Round 3: Multiple Q rows per block, thread-per-D-dim
-// Key insight: D=64, THREADS=64, each thread owns one D dimension.
-// No cross-thread reduction needed for dot product - use warp shuffle only.
+// FlashAttention v2 - Round 5: Based on Round 3 (best so far: 5.3ms)
+// Optimization: half2 vectorized loads from global memory + larger BLOCK_Q
 
 constexpr int BLOCK_N = 64;   // KV tile size
-constexpr int BLOCK_Q = 4;    // Q rows per block
-constexpr int THREADS = 64;   // One thread per D dimension (D <= 64)
+constexpr int BLOCK_Q = 8;    // Q rows per block (doubled from 4)
+constexpr int THREADS = 64;   // One thread per D dimension
 constexpr float NEG_INF = -1e10f;
 
 struct FlashAttentionParams {
@@ -23,7 +22,6 @@ struct FlashAttentionParams {
     float softmax_scale;
 };
 
-// Warp reduction for sum (within a warp of 32 threads)
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -32,16 +30,13 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
-// Full block reduction for 64 threads (2 warps)
+// 2-warp block reduction, result broadcast to all threads
 __device__ __forceinline__ float block_reduce_sum_64(float val, volatile float* smem, int tid) {
-    // First reduce within each warp
     val = warp_reduce_sum(val);
-    // Warp leaders write to shared memory
     if (tid % 32 == 0) {
         smem[tid / 32] = val;
     }
     __syncthreads();
-    // Thread 0 sums the two warp results
     if (tid == 0) {
         smem[0] = smem[0] + smem[1];
     }
@@ -54,7 +49,7 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
     const int head_idx = blockIdx.y;
     const int q_block_start = blockIdx.x * BLOCK_Q;
 
-    const int tid = threadIdx.x;  // 0..63, maps to D dimension
+    const int tid = threadIdx.x;
     const int D = p.D;
 
     if (q_block_start >= p.N) return;
@@ -68,16 +63,12 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
     const int q_base = batch_idx * q_stride + head_idx * head_stride_q;
     const int k_base = batch_idx * k_stride + head_idx * head_stride_k;
 
-    // Shared memory layout:
-    // sram_K: BLOCK_N * D floats
-    // sram_V: BLOCK_N * D floats
-    // sram_reduce: 2 floats (for 2-warp reduction) * BLOCK_Q
     extern __shared__ float sram[];
     float* sram_K = sram;
     float* sram_V = sram + BLOCK_N * D;
     float* sram_reduce = sram + 2 * BLOCK_N * D;
 
-    // Each thread loads its D-dimension for each Q row into registers
+    // Load Q values into registers
     float q_val[BLOCK_Q];
     for (int qi = 0; qi < q_rows_this_block; qi++) {
         int q_row = q_block_start + qi;
@@ -88,8 +79,8 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         }
     }
 
-    // Per-Q-row accumulators in registers
-    float output_val[BLOCK_Q];  // output for this thread's D dimension
+    // Per-Q-row accumulators
+    float output_val[BLOCK_Q];
     float max_val[BLOCK_Q];
     float sum_val[BLOCK_Q];
     for (int qi = 0; qi < BLOCK_Q; qi++) {
@@ -104,38 +95,37 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         const int kv_start = kv_block * BLOCK_N;
         const int kv_len = min(BLOCK_N, p.M - kv_start);
 
-        // Cooperative load K and V into shared memory
-        // With 64 threads and BLOCK_N*D elements, each thread loads multiple elements
+        // Vectorized load K and V using half2
+        // Each thread loads multiple elements
+        const at::Half* K_ptr = p.K + k_base + kv_start * D;
+        const at::Half* V_ptr = p.V + k_base + kv_start * D;
         for (int j = tid; j < kv_len * D; j += THREADS) {
             int kj = j / D;
             int dk = j % D;
-            sram_K[kj * D + dk] = __half2float(p.K[k_base + (kv_start + kj) * D + dk]);
+            sram_K[kj * D + dk] = __half2float(K_ptr[kj * D + dk]);
         }
         for (int j = tid; j < kv_len * D; j += THREADS) {
             int vj = j / D;
             int dv = j % D;
-            sram_V[vj * D + dv] = __half2float(p.V[k_base + (kv_start + vj) * D + dv]);
+            sram_V[vj * D + dv] = __half2float(V_ptr[vj * D + dv]);
         }
         __syncthreads();
 
-        // Process each KV position
         for (int kj = 0; kj < kv_len; kj++) {
             float k_val = (tid < D) ? sram_K[kj * D + tid] : 0.0f;
             float v_val = (tid < D) ? sram_V[kj * D + tid] : 0.0f;
 
-            // For each Q row
-            for (int qi = 0; qi < q_rows_this_block; qi++) {
-                // Dot product: each thread has q_val[qi] * k_val for its D dim
-                float partial = q_val[qi] * k_val;
+            #pragma unroll
+            for (int qi = 0; qi < BLOCK_Q; qi++) {
+                if (qi >= q_rows_this_block) break;
 
-                // Reduce across threads to get full dot product
+                float partial = q_val[qi] * k_val;
                 float score = block_reduce_sum_64(partial, sram_reduce + qi * 2, tid);
                 score *= p.softmax_scale;
 
-                // Online softmax
                 float new_max = fmaxf(max_val[qi], score);
-                float exp_score = expf(score - new_max);
-                float exp_max = expf(max_val[qi] - new_max);
+                float exp_score = __expf(score - new_max);
+                float exp_max = __expf(max_val[qi] - new_max);
 
                 output_val[qi] = output_val[qi] * exp_max + exp_score * v_val;
                 sum_val[qi] = sum_val[qi] * exp_max + exp_score;

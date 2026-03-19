@@ -70,6 +70,24 @@
 
 ---
 
+## Round 4: 单warp kernel (2026-03-19)
+- **测试配置**: B=1, H=8, N=512, M=512, D=64
+- **优化项**: THREADS=32 (单warp)，消除__syncthreads
+- **改动内容**: 每线程处理2个D维度，warp shuffle替代block reduction
+- **性能变化**: 5.3ms → 7.3ms
+- **结论**: ❌ 更慢，32线程加载shared memory太慢，occupancy低
+
+---
+
+## Round 5: BLOCK_Q=8 + __expf (2026-03-19)
+- **测试配置**: B=1, H=8, N=512, M=512, D=64
+- **优化项**: 基于Round 3增大BLOCK_Q到8，使用__expf快速数学
+- **改动内容**: BLOCK_Q从4增到8，expf改为__expf
+- **性能变化**: 5.3ms → 4.9ms
+- **结论**: ✅ 小幅提升 (累计 87ms → 4.9ms, 17.8x)
+
+---
+
 ## 使用方法
 
 1. **编译**:
