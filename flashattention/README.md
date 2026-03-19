@@ -1,7 +1,7 @@
 # Vibe Coding: FlashAttention 算子优化实战
 ![Claudecode](./logs/claudecode.png "claude code")
 刚开始用的MiniMax 2.5模型搭的框架和脚本，也实现了手写的cuda算子，但性能优化到87ms死活优化不下去了，所以斥巨资请来了Opus4.6, 果然一分价钱一分货。
-从零手写 CUDA FlashAttention 算子，经过 33 轮迭代优化，从 87ms 优化到 0.21ms（414x 加速）。同时实现 Triton 版本作为对比，~130 行 Python 达到甚至超越 PyTorch SDPA 的性能。
+从零手写 CUDA FlashAttention 算子，经过 34 轮迭代优化，从 87ms 优化到 0.179ms（486x 加速）。同时实现 Triton 版本作为对比，~130 行 Python 达到甚至超越 PyTorch SDPA 的性能。
 
 ## 目的
 
@@ -17,15 +17,15 @@
 
 | Config (B,H,N,M,D) | PyTorch SDPA | Triton | Custom CUDA |
 |---------------------|-------------|--------|-------------|
-| 1,8,512,512,64 | 0.057ms | 0.067ms | 0.212ms |
-| 1,8,1024,1024,64 | 0.130ms | 0.148ms | 0.576ms |
+| 1,8,512,512,64 | 0.057ms | 0.067ms | 0.179ms |
+| 1,8,1024,1024,64 | 0.130ms | 0.148ms | 0.490ms |
 | 1,16,2048,2048,64 | 0.747ms | 0.681ms | 4.356ms |
 | 2,16,2048,2048,64 | 1.551ms | 1.306ms | 8.522ms |
 | 4,16,4096,4096,64 | 13.059ms | 10.104ms | 66.567ms |
 
 ### 核心发现
 
-- **手写 CUDA**: 303 行代码，33 轮优化，87ms → 0.21ms（414x），但仍比 PyTorch 慢 3.7x
+- **手写 CUDA**: 303 行代码，34 轮优化，87ms → 0.179ms（486x），但仍比 PyTorch 慢 3.2x
 - **Triton**: 130 行 Python，大配置上比 PyTorch SDPA 快 22%，开发效率远超手写 CUDA
 - **瓶颈分析**: 手写 CUDA 的主要差距来自 shared memory 占用限制 occupancy、缺少 software pipelining、以及 softmax 标量操作无法利用 Tensor Core
 
@@ -150,7 +150,7 @@ python run.py --performance
 | 31 | Autotune | 10.148ms | 10种配置自动选择最优 tile size |
 | 32 | Pre-scale Q + EVEN mask | 10.392ms | 预缩放Q + 条件mask，效果有限 |
 
-### 第五阶段：Profiling 驱动优化（0.22ms → 0.21ms）
+### 第五阶段：Profiling 驱动优化（0.22ms → 0.179ms）
 
 ![Occupancy对比](./logs/occupancy_comparison.png)
 
@@ -164,8 +164,11 @@ Occupancy: 8.3% (4/48 warps active per SM)
 | Round | 优化项 | 性能 | 说明 |
 |-------|--------|------|------|
 | 33 | K/V共用buffer + S_float复用KV空间 | 0.212ms | smem 28KB→16KB, occupancy 8.3%→16.7% |
+| 34 | Register-cached softmax | 0.179ms | softmax中间值缓存到寄存器，避免重读smem |
 
-关键改动：WMMA 计算 QK^T 后 sync，将结果写入 KV_tile 区域（K 已不需要），softmax 完成后再加载 V。N=1024 配置提升 31%（0.830→0.576ms）。
+Round 33 关键改动：WMMA 计算 QK^T 后 sync，将结果写入 KV_tile 区域（K 已不需要），softmax 完成后再加载 V。N=1024 配置提升 31%（0.830→0.576ms）。
+
+Round 34 关键改动：scale+max pass 中将 scaled 值存入寄存器数组，exp+sum pass 直接从寄存器读取，减少 shared memory 带宽压力。N=512 提升 16%（0.212→0.179ms）。
 
 ## 关键技术总结
 
@@ -177,6 +180,7 @@ Occupancy: 8.3% (4/48 warps active per SM)
 4. **Tile size 调优**: BLOCK_KV=64 是最优平衡点（shared memory vs 迭代次数）
 5. **消除中间缓冲**: WMMA 直接累加到 O_acc，省掉 O_tile
 6. **Profiling 驱动的 smem 优化**: 通过 occupancy 分析发现瓶颈，K/V 共用 buffer 将 smem 从 28KB 降到 16KB，occupancy 翻倍
+7. **Register-cached softmax**: softmax 中间值缓存到寄存器数组，exp 阶段从寄存器读取避免重读 shared memory
 
 ### 无效的优化
 
@@ -193,8 +197,8 @@ Occupancy: 8.3% (4/48 warps active per SM)
 | 维度 | 手写 CUDA | Triton |
 |------|----------|--------|
 | 代码量 | 303 行 | 130 行 |
-| 开发周期 | 31 轮迭代 | 3 轮迭代 |
-| 性能 (小配置) | 0.22ms | 0.07ms |
+| 开发周期 | 34 轮迭代 | 3 轮迭代 |
+| 性能 (小配置) | 0.179ms | 0.07ms |
 | 性能 (大配置) | 68ms | 10ms |
 | Tensor Core | 手动 WMMA | 自动 tl.dot |
 | Shared memory | 手动管理 | 编译器自动 |
