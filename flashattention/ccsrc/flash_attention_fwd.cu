@@ -5,14 +5,14 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <algorithm>
 
-// FlashAttention v2 - Round 6: Warp-per-Q-row, multiple warps per block
+// FlashAttention v2 - Round 7: 8 warps per block for higher occupancy
 // Each warp independently handles one Q row. No cross-warp sync in hot loop.
-// 4 warps = 128 threads, each warp processes one Q row.
+// 8 warps = 256 threads, each warp processes one Q row.
 // D=64: each thread in warp handles 2 D dimensions.
 
 constexpr int BLOCK_N = 64;    // KV tile size
-constexpr int NUM_WARPS = 4;   // Warps per block = Q rows per block
-constexpr int THREADS = NUM_WARPS * 32;  // 128
+constexpr int NUM_WARPS = 8;   // Warps per block = Q rows per block
+constexpr int THREADS = NUM_WARPS * 32;  // 256
 constexpr float NEG_INF = -1e10f;
 
 struct FlashAttentionParams {
