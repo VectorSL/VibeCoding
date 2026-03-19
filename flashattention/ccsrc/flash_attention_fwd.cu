@@ -6,9 +6,10 @@
 #include <mma.h>
 #include <algorithm>
 
-// FlashAttention v2 - Round 18: BLOCK_KV=64, 4 WMMA tiles
-// QK^T: 4 warps each compute 16 KV positions
-// PV: 4 K-tiles of 16 per D-tile
+// FlashAttention v2 - Round 26: Warp shuffle reduce + double buffer + reduced smem
+// 1. Warp shuffle for softmax reduce (no shared memory partials)
+// 2. Reorganize threads: 8 threads/row within same warp for shuffle
+// 3. Remove row_max_partial and row_sum_partial from shared memory
 
 using namespace nvcuda;
 
@@ -21,6 +22,12 @@ constexpr int NUM_WARPS = 4;
 constexpr int THREADS = NUM_WARPS * 32;
 constexpr float NEG_INF = -1e10f;
 
+// Thread mapping for softmax: 8 threads per Q row
+// warp 0: rows 0-3 (lanes 0-7 = row0, 8-15 = row1, 16-23 = row2, 24-31 = row3)
+// warp 1: rows 4-7
+// warp 2: rows 8-11
+// warp 3: rows 12-15
+
 struct FlashAttentionParams {
     const at::Half* Q;
     const at::Half* K;
@@ -30,6 +37,22 @@ struct FlashAttentionParams {
     float softmax_scale;
 };
 
+// Warp-level reduce max across 8 lanes (stride 8 within warp)
+__device__ __forceinline__ float warp_reduce_max_8(float val) {
+    val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 4));
+    val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 2));
+    val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 1));
+    return val;
+}
+
+// Warp-level reduce sum across 8 lanes
+__device__ __forceinline__ float warp_reduce_sum_8(float val) {
+    val += __shfl_xor_sync(0xffffffff, val, 4);
+    val += __shfl_xor_sync(0xffffffff, val, 2);
+    val += __shfl_xor_sync(0xffffffff, val, 1);
+    return val;
+}
+
 __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
     const int batch_idx = blockIdx.z;
     const int head_idx = blockIdx.y;
@@ -37,6 +60,7 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
 
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
     const int D = p.D;
 
     if (q_block_start >= p.N) return;
@@ -47,6 +71,11 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
     const int q_base = batch_idx * q_stride + head_idx * p.N * D;
     const int k_base = batch_idx * k_stride + head_idx * p.M * D;
 
+    // Softmax thread mapping: which Q row does this thread work on?
+    const int sm_qi = warp_id * 4 + lane_id / 8;   // Q row index (0-15)
+    const int sm_chunk = lane_id % 8;                // chunk index (0-7)
+    const int kv_per_thread = BLOCK_KV / 8;          // 8
+
     extern __shared__ char smem_raw[];
     half* Q_tile = reinterpret_cast<half*>(smem_raw);
     half* K_tile = Q_tile + BLOCK_Q * D;
@@ -56,6 +85,8 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
     float* max_vals = reinterpret_cast<float*>(P_half + BLOCK_Q * BLOCK_KV);
     float* sum_vals = max_vals + BLOCK_Q;
     float* O_acc = sum_vals + BLOCK_Q;
+    // exp_corr stored in shared memory (16 floats, needed cross-warp)
+    float* exp_corr = O_acc + BLOCK_Q * D;
 
     // Load Q tile
     for (int j = tid; j < BLOCK_Q * D; j += THREADS) {
@@ -80,24 +111,21 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         const int kv_start = kv_block * BLOCK_KV;
         const int kv_len = min(BLOCK_KV, p.M - kv_start);
 
-        // Load K and V tiles (vectorized with float4 = 8 halfs at a time)
+        // Load K and V tiles (vectorized)
         {
             const int total_halfs = BLOCK_KV * D;
-            const int total_vec = total_halfs / 8;  // float4 = 8 halfs
+            const int total_vec = total_halfs / 8;
             float4* K_vec = reinterpret_cast<float4*>(K_tile);
             float4* V_vec = reinterpret_cast<float4*>(V_tile);
             const float4* K_src = reinterpret_cast<const float4*>(p.K + k_base + kv_start * D);
             const float4* V_src = reinterpret_cast<const float4*>(p.V + k_base + kv_start * D);
-            const float4 zero4 = {0.0f, 0.0f, 0.0f, 0.0f};
 
             if (kv_len == BLOCK_KV) {
-                // Full tile - no bounds checking needed
                 for (int i = tid; i < total_vec; i += THREADS) {
                     K_vec[i] = K_src[i];
                     V_vec[i] = V_src[i];
                 }
             } else {
-                // Partial tile
                 for (int j = tid; j < BLOCK_KV * D; j += THREADS) {
                     int ki = j / D;
                     int dk = j % D;
@@ -114,10 +142,8 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         __syncthreads();
 
         // Step 1: WMMA QK^T -> S_float[16x64]
-        // 4 WMMA tiles: each warp does 16 KV positions
         {
             const int kv_offset = warp_id * WMMA_N;
-
             wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
             wmma::fill_fragment(acc_frag, 0.0f);
 
@@ -133,90 +159,58 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         }
         __syncthreads();
 
-        // Step 2: Online softmax + produce P_half (parallelized)
+        // Step 2: Online softmax with warp shuffle reduce
 
-        // 2a: Scale + find row max in ONE pass
-        // 8 threads per row, each handles 8 KV positions, all 128 threads active
-        __shared__ float row_max_partial[BLOCK_Q * 8];
-        {
-            const int threads_per_row = 8;
-            const int kv_per_thread = BLOCK_KV / threads_per_row;  // 8
-            const int total_jobs = BLOCK_Q * threads_per_row;  // 128
-            for (int job = tid; job < total_jobs; job += THREADS) {
-                int qi = job / threads_per_row;
-                int chunk = job % threads_per_row;
-                int kj_start = chunk * kv_per_thread;
-                int kj_end = kj_start + kv_per_thread;
-
-                float local_max = NEG_INF;
-                if (qi < q_rows) {
-                    for (int kj = kj_start; kj < kj_end && kj < kv_len; kj++) {
-                        float s = S_float[qi * BLOCK_KV + kj] * p.softmax_scale;
-                        S_float[qi * BLOCK_KV + kj] = s;
-                        local_max = fmaxf(local_max, s);
-                    }
-                }
-                row_max_partial[qi * threads_per_row + chunk] = local_max;
+        // 2a: Scale + find row max using warp shuffle
+        float local_max = NEG_INF;
+        if (sm_qi < q_rows) {
+            int kj_start = sm_chunk * kv_per_thread;
+            int kj_end = kj_start + kv_per_thread;
+            for (int kj = kj_start; kj < kj_end && kj < kv_len; kj++) {
+                float s = S_float[sm_qi * BLOCK_KV + kj] * p.softmax_scale;
+                S_float[sm_qi * BLOCK_KV + kj] = s;
+                local_max = fmaxf(local_max, s);
             }
         }
-        __syncthreads();
+        // Reduce max within 8 threads of same row (within warp)
+        float row_max = warp_reduce_max_8(local_max);
+        row_max = fmaxf(row_max, max_vals[sm_qi]);
 
-        // 2b: Reduce partial maxes and compute exp_correction
-        __shared__ float exp_corr[BLOCK_Q];
-        if (tid < BLOCK_Q && tid < q_rows) {
-            float row_max = max_vals[tid];
-            #pragma unroll
-            for (int i = 0; i < 8; i++) {
-                row_max = fmaxf(row_max, row_max_partial[tid * 8 + i]);
-            }
-            exp_corr[tid] = __expf(max_vals[tid] - row_max);
-            max_vals[tid] = row_max;
+        // First thread of each row writes exp_corr
+        float ec;
+        if (sm_chunk == 0 && sm_qi < q_rows) {
+            ec = __expf(max_vals[sm_qi] - row_max);
+            exp_corr[sm_qi] = ec;
+            max_vals[sm_qi] = row_max;
         }
         __syncthreads();
+        // All threads read exp_corr for their row
+        ec = exp_corr[sm_qi];
+        float my_row_max = max_vals[sm_qi];
 
-        // 2c: Compute exp + P_half + row sums in ONE pass
-        __shared__ float row_sum_partial[BLOCK_Q * 8];
-        {
-            const int threads_per_row = 8;
-            const int kv_per_thread = BLOCK_KV / threads_per_row;  // 8
-            const int total_jobs = BLOCK_Q * threads_per_row;  // 128
-            for (int job = tid; job < total_jobs; job += THREADS) {
-                int qi = job / threads_per_row;
-                int chunk = job % threads_per_row;
-                int kj_start = chunk * kv_per_thread;
-                int kj_end = kj_start + kv_per_thread;
-
-                float local_sum = 0.0f;
-                if (qi < q_rows) {
-                    float rm = max_vals[qi];
-                    for (int kj = kj_start; kj < kj_end; kj++) {
-                        if (kj < kv_len) {
-                            float ev = __expf(S_float[qi * BLOCK_KV + kj] - rm);
-                            P_half[qi * BLOCK_KV + kj] = __float2half(ev);
-                            local_sum += ev;
-                        } else {
-                            P_half[qi * BLOCK_KV + kj] = __float2half(0.0f);
-                        }
-                    }
+        // 2b: Compute exp + P_half + row sums with warp shuffle
+        float local_sum = 0.0f;
+        if (sm_qi < q_rows) {
+            int kj_start = sm_chunk * kv_per_thread;
+            int kj_end = kj_start + kv_per_thread;
+            for (int kj = kj_start; kj < kj_end; kj++) {
+                if (kj < kv_len) {
+                    float ev = __expf(S_float[sm_qi * BLOCK_KV + kj] - my_row_max);
+                    P_half[sm_qi * BLOCK_KV + kj] = __float2half(ev);
+                    local_sum += ev;
                 } else {
-                    for (int kj = kj_start; kj < kj_end; kj++) {
-                        P_half[qi * BLOCK_KV + kj] = __float2half(0.0f);
-                    }
+                    P_half[sm_qi * BLOCK_KV + kj] = __float2half(0.0f);
                 }
-                row_sum_partial[qi * threads_per_row + chunk] = local_sum;
             }
         }
-        __syncthreads();
+        float row_sum = warp_reduce_sum_8(local_sum);
 
-        // 2d: Reduce sums + rescale O_acc
-        if (tid < BLOCK_Q && tid < q_rows) {
-            float psum = 0.0f;
-            #pragma unroll
-            for (int i = 0; i < 8; i++) {
-                psum += row_sum_partial[tid * 8 + i];
-            }
-            sum_vals[tid] = sum_vals[tid] * exp_corr[tid] + psum;
+        // First thread of each row updates sum_vals
+        if (sm_chunk == 0 && sm_qi < q_rows) {
+            sum_vals[sm_qi] = sum_vals[sm_qi] * ec + row_sum;
         }
+
+        // Rescale O_acc in parallel
         for (int j = tid; j < q_rows * D; j += THREADS) {
             int qi = j / D;
             O_acc[j] *= exp_corr[qi];
@@ -224,11 +218,8 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         __syncthreads();
 
         // Step 3: WMMA P @ V -> directly into O_acc
-        // P[16x64] @ V[64xD]: split into D-tiles of 16
-        // Load O_acc into accumulator, WMMA adds PV on top, store back
         for (int dt = warp_id; dt < d_tiles; dt += NUM_WARPS) {
             wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> pv_acc;
-            // Initialize accumulator with current O_acc values
             wmma::load_matrix_sync(pv_acc, O_acc + dt * WMMA_N, D, wmma::mem_row_major);
 
             #pragma unroll
@@ -281,12 +272,13 @@ torch::Tensor flash_attention_fwd(torch::Tensor Q, torch::Tensor K, torch::Tenso
     dim3 grid(grid_q, H, B);
     dim3 block(THREADS);
 
-    size_t shared_mem = (BLOCK_Q * D + BLOCK_KV * D + BLOCK_KV * D) * sizeof(half)
-                      + BLOCK_Q * BLOCK_KV * sizeof(float)
-                      + BLOCK_Q * BLOCK_KV * sizeof(half)
-                      + 2 * BLOCK_Q * sizeof(float)
-                      + BLOCK_Q * D * sizeof(float)
-                      + BLOCK_Q * 8 * sizeof(float) * 2;  // row_max_partial + row_sum_partial
+    // Reduced shared memory: no row_max_partial, no row_sum_partial
+    size_t shared_mem = (BLOCK_Q * D + BLOCK_KV * D + BLOCK_KV * D) * sizeof(half)  // Q, K, V
+                      + BLOCK_Q * BLOCK_KV * sizeof(float)    // S_float
+                      + BLOCK_Q * BLOCK_KV * sizeof(half)     // P_half
+                      + 2 * BLOCK_Q * sizeof(float)            // max_vals, sum_vals
+                      + BLOCK_Q * D * sizeof(float)            // O_acc
+                      + BLOCK_Q * sizeof(float);               // exp_corr
 
     flash_attention_fwd_kernel<<<grid, block, shared_mem, at::cuda::getCurrentCUDAStream()>>>(params);
     cudaError_t err = cudaGetLastError();
