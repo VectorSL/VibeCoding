@@ -6,10 +6,9 @@
 #include <mma.h>
 #include <algorithm>
 
-// FlashAttention v2 - Round 17: BLOCK_KV=32, double WMMA tiles
-// Reduce tile iterations from 32 to 16 by processing 32 KV per tile.
-// QK^T: 2 WMMA ops (16x16 each, covering 32 KV positions)
-// PV: P[16x32] @ V[32xD] = 2 WMMA ops per D-tile (K dimension split)
+// FlashAttention v2 - Round 18: BLOCK_KV=64, 4 WMMA tiles
+// QK^T: 4 warps each compute 16 KV positions
+// PV: 4 K-tiles of 16 per D-tile
 
 using namespace nvcuda;
 
@@ -17,7 +16,7 @@ constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
 constexpr int BLOCK_Q = 16;
-constexpr int BLOCK_KV = 32;
+constexpr int BLOCK_KV = 64;
 constexpr int NUM_WARPS = 4;
 constexpr int THREADS = NUM_WARPS * 32;
 constexpr float NEG_INF = -1e10f;
@@ -96,9 +95,9 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         }
         __syncthreads();
 
-        // Step 1: WMMA QK^T -> S_float[16x32]
-        // 2 WMMA tiles: warp 0 does KV[0:16], warp 1 does KV[16:32]
-        if (warp_id < 2) {
+        // Step 1: WMMA QK^T -> S_float[16x64]
+        // 4 WMMA tiles: each warp does 16 KV positions
+        {
             const int kv_offset = warp_id * WMMA_N;
 
             wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
@@ -151,26 +150,18 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         __syncthreads();
 
         // Step 3: WMMA P @ V -> O_tile[16xD]
-        // P[16x32] @ V[32xD]: split into D-tiles of 16
-        // For each D-tile: accumulate over 2 K-tiles of 16
+        // P[16x64] @ V[64xD]: split into D-tiles of 16
+        // For each D-tile: accumulate over 4 K-tiles of 16
         for (int dt = warp_id; dt < d_tiles; dt += NUM_WARPS) {
             wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> pv_acc;
             wmma::fill_fragment(pv_acc, 0.0f);
 
-            // K-tile 0: P[16x16] @ V[0:16, dt*16:(dt+1)*16]
-            {
+            #pragma unroll
+            for (int kt = 0; kt < 4; kt++) {
                 wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> p_frag;
                 wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> v_frag;
-                wmma::load_matrix_sync(p_frag, P_half, BLOCK_KV);
-                wmma::load_matrix_sync(v_frag, V_tile + dt * WMMA_N, D);
-                wmma::mma_sync(pv_acc, p_frag, v_frag, pv_acc);
-            }
-            // K-tile 1: P[16x16] @ V[16:32, dt*16:(dt+1)*16]
-            {
-                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> p_frag;
-                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> v_frag;
-                wmma::load_matrix_sync(p_frag, P_half + WMMA_K, BLOCK_KV);
-                wmma::load_matrix_sync(v_frag, V_tile + WMMA_K * D + dt * WMMA_N, D);
+                wmma::load_matrix_sync(p_frag, P_half + kt * WMMA_K, BLOCK_KV);
+                wmma::load_matrix_sync(v_frag, V_tile + kt * WMMA_K * D + dt * WMMA_N, D);
                 wmma::mma_sync(pv_acc, p_frag, v_frag, pv_acc);
             }
 
