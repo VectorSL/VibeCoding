@@ -135,16 +135,18 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
 
         // Step 2: Online softmax + produce P_half (parallelized)
 
-        // 2a: Scale + find row max in ONE pass (merged, saves 1 sync)
-        __shared__ float row_max_partial[BLOCK_Q * 4];
+        // 2a: Scale + find row max in ONE pass
+        // 8 threads per row, each handles 8 KV positions, all 128 threads active
+        __shared__ float row_max_partial[BLOCK_Q * 8];
         {
-            const int threads_per_row = 4;
-            const int total_jobs = BLOCK_Q * threads_per_row;  // 64
+            const int threads_per_row = 8;
+            const int kv_per_thread = BLOCK_KV / threads_per_row;  // 8
+            const int total_jobs = BLOCK_Q * threads_per_row;  // 128
             for (int job = tid; job < total_jobs; job += THREADS) {
                 int qi = job / threads_per_row;
                 int chunk = job % threads_per_row;
-                int kj_start = chunk * (BLOCK_KV / threads_per_row);
-                int kj_end = kj_start + (BLOCK_KV / threads_per_row);
+                int kj_start = chunk * kv_per_thread;
+                int kj_end = kj_start + kv_per_thread;
 
                 float local_max = NEG_INF;
                 if (qi < q_rows) {
@@ -162,27 +164,27 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         // 2b: Reduce partial maxes and compute exp_correction
         __shared__ float exp_corr[BLOCK_Q];
         if (tid < BLOCK_Q && tid < q_rows) {
-            float row_max = row_max_partial[tid * 4];
-            row_max = fmaxf(row_max, row_max_partial[tid * 4 + 1]);
-            row_max = fmaxf(row_max, row_max_partial[tid * 4 + 2]);
-            row_max = fmaxf(row_max, row_max_partial[tid * 4 + 3]);
-            row_max = fmaxf(row_max, max_vals[tid]);
-
+            float row_max = max_vals[tid];
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                row_max = fmaxf(row_max, row_max_partial[tid * 8 + i]);
+            }
             exp_corr[tid] = __expf(max_vals[tid] - row_max);
             max_vals[tid] = row_max;
         }
         __syncthreads();
 
-        // 2c: Compute exp + P_half + row sums in ONE pass (merged)
-        __shared__ float row_sum_partial[BLOCK_Q * 4];
+        // 2c: Compute exp + P_half + row sums in ONE pass
+        __shared__ float row_sum_partial[BLOCK_Q * 8];
         {
-            const int threads_per_row = 4;
-            const int total_jobs = BLOCK_Q * threads_per_row;  // 64
+            const int threads_per_row = 8;
+            const int kv_per_thread = BLOCK_KV / threads_per_row;  // 8
+            const int total_jobs = BLOCK_Q * threads_per_row;  // 128
             for (int job = tid; job < total_jobs; job += THREADS) {
                 int qi = job / threads_per_row;
                 int chunk = job % threads_per_row;
-                int kj_start = chunk * (BLOCK_KV / threads_per_row);
-                int kj_end = kj_start + (BLOCK_KV / threads_per_row);
+                int kj_start = chunk * kv_per_thread;
+                int kj_end = kj_start + kv_per_thread;
 
                 float local_sum = 0.0f;
                 if (qi < q_rows) {
@@ -206,10 +208,13 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         }
         __syncthreads();
 
-        // 2d: Reduce sums + rescale O_acc (merged)
+        // 2d: Reduce sums + rescale O_acc
         if (tid < BLOCK_Q && tid < q_rows) {
-            float psum = row_sum_partial[tid * 4] + row_sum_partial[tid * 4 + 1]
-                       + row_sum_partial[tid * 4 + 2] + row_sum_partial[tid * 4 + 3];
+            float psum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                psum += row_sum_partial[tid * 8 + i];
+            }
             sum_vals[tid] = sum_vals[tid] * exp_corr[tid] + psum;
         }
         for (int j = tid; j < q_rows * D; j += THREADS) {
@@ -281,7 +286,7 @@ torch::Tensor flash_attention_fwd(torch::Tensor Q, torch::Tensor K, torch::Tenso
                       + BLOCK_Q * BLOCK_KV * sizeof(half)
                       + 2 * BLOCK_Q * sizeof(float)
                       + BLOCK_Q * D * sizeof(float)
-                      + BLOCK_Q * 4 * sizeof(float) * 2;  // row_max_partial + row_sum_partial
+                      + BLOCK_Q * 8 * sizeof(float) * 2;  // row_max_partial + row_sum_partial
 
     flash_attention_fwd_kernel<<<grid, block, shared_mem, at::cuda::getCurrentCUDAStream()>>>(params);
     cudaError_t err = cudaGetLastError();

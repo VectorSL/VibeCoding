@@ -250,6 +250,18 @@
 
 ---
 
+## Round 25: 8 threads/row softmax (2026-03-19)
+- **测试配置**: B=1, H=8, N=512, M=512, D=64
+- **优化项**: softmax reduce 从 4 threads/row 改为 8 threads/row
+- **改动内容**:
+  - scale+max: 8 threads/row × 16 rows = 128 threads 全部参与
+  - exp+sum: 同样 8 threads/row，每线程处理 8 个 KV
+  - 消除了之前 64 个线程空闲的问题
+- **性能变化**: 0.26ms → 0.22ms
+- **结论**: ✅ 提升16% (累计 87ms → 0.22ms, 395.5x)
+
+---
+
 ## 使用方法
 
 1. **编译**:
