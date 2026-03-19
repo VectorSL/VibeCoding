@@ -49,6 +49,27 @@
 
 ---
 
+## Round 2: 线程并行 dot product (2026-03-19)
+- **测试配置**: B=1, H=8, N=512, M=512, D=64
+- **优化项**: 让所有128线程并行参与dot product计算，用block reduction汇总
+- **改动内容**: 每个线程负责部分D维度的乘加，通过warp+shared memory reduction得到完整dot product
+- **性能变化**: 87ms → 15.5ms
+- **结论**: ✅ 有效，提升5.6x
+
+---
+
+## Round 3: 多Q行tiling + thread-per-D (2026-03-19)
+- **测试配置**: B=1, H=8, N=512, M=512, D=64
+- **优化项**: THREADS=64 (一个线程对应一个D维度)，BLOCK_Q=4 (每block处理4个Q行)
+- **改动内容**:
+  - 将THREADS从128改为64，匹配D=64，每线程负责一个D维度
+  - 每个block处理BLOCK_Q=4个Q行，提高block利用率
+  - 减少grid大小(N/4)，增加每block工作量
+- **性能变化**: 15.5ms → 5.3ms
+- **结论**: ✅ 有效，提升2.9x (累计从87ms→5.3ms，16.4x)
+
+---
+
 ## 使用方法
 
 1. **编译**:
