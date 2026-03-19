@@ -1,5 +1,5 @@
 # Vibe Coding: FlashAttention 算子优化实战
-![Claudecode](./notes/claudecode.png "claude code")
+![Claudecode](./logs/claudecode.png "claude code")
 刚开始用的MiniMax 2.5模型搭的框架和脚本，也实现了手写的cuda算子，但性能优化到87ms死活优化不下去了，所以斥巨资请来了Opus4.6, 果然一分价钱一分货。
 从零手写 CUDA FlashAttention 算子，经过 33 轮迭代优化，从 87ms 优化到 0.21ms（414x 加速）。同时实现 Triton 版本作为对比，~130 行 Python 达到甚至超越 PyTorch SDPA 的性能。
 
@@ -12,6 +12,8 @@
 ## 结论
 
 ### 最终性能对比（RTX 4060 Laptop, fp16）
+
+![三方性能对比](./logs/three_way_comparison.png)
 
 | Config (B,H,N,M,D) | PyTorch SDPA | Triton | Custom CUDA |
 |---------------------|-------------|--------|-------------|
@@ -40,8 +42,13 @@ flashattention/
 ├── python/
 │   ├── attention.py              # Python 绑定 + benchmark 框架
 │   └── triton_flash_attn.py      # Triton 实现 (130行)
-├── notes/
-│   └── perf_log.md               # 详细性能日志
+├── logs/
+│   ├── perf_log.md               # 详细性能日志
+│   ├── cuda_optimization_journey.png  # CUDA优化历程图
+│   ├── three_way_comparison.png   # 三方性能对比图
+│   ├── performance_ratio.png      # 性能比率图
+│   ├── occupancy_comparison.png   # Occupancy对比图
+│   └── dev_effort_comparison.png  # 开发效率对比图
 ├── profile_kernel.py             # Kernel occupancy 分析脚本
 ├── setup.py                      # CUDA 编译配置
 └── run.py                        # 运行入口
@@ -93,6 +100,8 @@ python run.py --performance
 
 ## 优化迭代记录
 
+![CUDA优化历程](./logs/cuda_optimization_journey.png)
+
 ### 第一阶段：基础优化（87ms → 2.14ms, 40x）
 
 | Round | 优化项 | 性能 | 加速比 | 说明 |
@@ -143,6 +152,8 @@ python run.py --performance
 
 ### 第五阶段：Profiling 驱动优化（0.22ms → 0.21ms）
 
+![Occupancy对比](./logs/occupancy_comparison.png)
+
 使用 torch profiler 和 occupancy 分析工具（ncu 需要管理员权限），发现核心瓶颈：
 
 ```
@@ -176,6 +187,8 @@ Occupancy: 8.3% (4/48 warps active per SM)
 5. **常量内存、循环展开**: 编译器已自动优化
 
 ### Triton vs 手写 CUDA
+
+![开发效率对比](./logs/dev_effort_comparison.png)
 
 | 维度 | 手写 CUDA | Triton |
 |------|----------|--------|
