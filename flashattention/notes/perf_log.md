@@ -88,6 +88,19 @@
 
 ---
 
+## Round 6: Warp-per-Q-row 架构 (2026-03-19)
+- **测试配置**: B=1, H=8, N=512, M=512, D=64
+- **优化项**: 每个warp独立处理一个Q行，block内4个warp并行处理4个Q行
+- **改动内容**:
+  - 4 warps (128 threads)，每warp处理一个Q行
+  - dot product只需warp shuffle，热循环中无__syncthreads
+  - 只在KV tile加载时sync一次
+  - 每lane处理2个D维度 (D=64, 32 lanes)
+- **性能变化**: 4.9ms → 2.66ms
+- **结论**: ✅ 有效，提升1.84x (累计 87ms → 2.66ms, 32.7x)
+
+---
+
 ## 使用方法
 
 1. **编译**:
