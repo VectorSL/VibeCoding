@@ -5,13 +5,11 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <algorithm>
 
-// FlashAttention v2 - Round 7: 8 warps per block for higher occupancy
-// Each warp independently handles one Q row. No cross-warp sync in hot loop.
-// 8 warps = 256 threads, each warp processes one Q row.
-// D=64: each thread in warp handles 2 D dimensions.
+// FlashAttention v2 - Round 12: Correct arch target + remove register limit
+// Based on Round 7 (best: 2.20ms)
 
-constexpr int BLOCK_N = 64;    // KV tile size
-constexpr int NUM_WARPS = 8;   // Warps per block = Q rows per block
+constexpr int BLOCK_N = 64;
+constexpr int NUM_WARPS = 8;
 constexpr int THREADS = NUM_WARPS * 32;  // 256
 constexpr float NEG_INF = -1e10f;
 
@@ -41,9 +39,8 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
     const int D = p.D;
-    const int d_per_lane = (D + 31) / 32;  // 2 for D=64
+    const int d_per_lane = (D + 31) / 32;
 
-    // This warp's Q row
     const int q_row = q_block_start + warp_id;
     if (q_row >= p.N) return;
 
@@ -55,24 +52,18 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
     const int q_base = batch_idx * q_stride + head_idx * head_stride_q;
     const int k_base = batch_idx * k_stride + head_idx * head_stride_k;
 
-    // Shared memory for K and V tiles (shared across all warps)
     extern __shared__ float sram[];
     float* sram_K = sram;
     float* sram_V = sram + BLOCK_N * D;
 
-    // Load Q into registers (each lane handles d_per_lane dimensions)
-    float q_reg[4];  // max 4 D dims per lane
+    // Load Q into registers
+    float q_reg[4];
     #pragma unroll
     for (int di = 0; di < d_per_lane; di++) {
         int d = lane_id + di * 32;
-        if (d < D) {
-            q_reg[di] = __half2float(p.Q[q_base + q_row * D + d]);
-        } else {
-            q_reg[di] = 0.0f;
-        }
+        q_reg[di] = (d < D) ? __half2float(p.Q[q_base + q_row * D + d]) : 0.0f;
     }
 
-    // Accumulators
     float out_reg[4];
     #pragma unroll
     for (int di = 0; di < d_per_lane; di++) {
@@ -87,7 +78,6 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         const int kv_start = kv_block * BLOCK_N;
         const int kv_len = min(BLOCK_N, p.M - kv_start);
 
-        // All threads cooperatively load K and V into shared memory
         for (int j = tid; j < kv_len * D; j += THREADS) {
             int kj = j / D;
             int dk = j % D;
@@ -100,9 +90,7 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         }
         __syncthreads();
 
-        // Each warp processes its Q row against all KV in tile
         for (int kj = 0; kj < kv_len; kj++) {
-            // Dot product Q * K[kj]
             float partial = 0.0f;
             #pragma unroll
             for (int di = 0; di < d_per_lane; di++) {
@@ -111,11 +99,9 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
                     partial += q_reg[di] * sram_K[kj * D + d];
                 }
             }
-            // Warp-level reduction only - no __syncthreads!
             float score = warp_reduce_sum(partial);
             score *= p.softmax_scale;
 
-            // Online softmax update
             float new_max = fmaxf(max_val, score);
             float exp_score = __expf(score - new_max);
             float exp_max = __expf(max_val - new_max);
@@ -131,11 +117,9 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
             max_val = new_max;
         }
 
-        // Need sync before next tile load overwrites shared memory
         __syncthreads();
     }
 
-    // Write output
     const int o_offset = q_base + q_row * D;
     #pragma unroll
     for (int di = 0; di < d_per_lane; di++) {

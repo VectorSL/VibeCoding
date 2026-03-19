@@ -110,6 +110,28 @@
 
 ---
 
+## Round 8-11: 无效尝试 (2026-03-19)
+
+| Round | 优化项 | 性能 | 结论 |
+|-------|--------|------|------|
+| 8 | half shared memory + BLOCK_N=128 | 2.23ms | ➖ 持平 |
+| 9 | shared memory bank conflict padding | 2.29ms | ❌ 无效 |
+| 10 | Lane-per-KV (每lane算完整dot product) | 5.85ms | ❌ 更慢 |
+| 11 | 寄存器缓存4个KV positions | 3.40ms | ❌ 更慢 |
+
+---
+
+## Round 12: 修复编译架构 + 去掉寄存器限制 (2026-03-19)
+- **测试配置**: B=1, H=8, N=512, M=512, D=64
+- **优化项**: 修复setup.py架构检测bug (sm_80→sm_89)，去掉-maxrregcount=128
+- **改动内容**:
+  - 修复get_device_capability只取major的bug，现在正确生成sm_89
+  - 去掉-maxrregcount=128，让编译器自由分配寄存器
+- **性能变化**: 2.20ms → 2.14ms
+- **结论**: ✅ 小幅提升 (累计 87ms → 2.14ms, 40.7x)
+
+---
+
 ## 使用方法
 
 1. **编译**:

@@ -8,8 +8,8 @@ def get_extensions():
     cuda_arch_list = []
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
-            major = torch.cuda.get_device_capability(i)[0]
-            cuda_arch_list.append(f"{major}{0}")
+            major, minor = torch.cuda.get_device_capability(i)
+            cuda_arch_list.append(f"{major}{minor}")
     else:
         # Default fallback
         cuda_arch_list = ["80", "86", "89", "90"]
@@ -29,7 +29,6 @@ def get_extensions():
 
     # Add extra NVCC flags for optimization
     nvcc_flags.extend([
-        '-maxrregcount=128',
         '--extra-device-vectorization',
     ])
 
