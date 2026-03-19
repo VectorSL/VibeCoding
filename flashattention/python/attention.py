@@ -20,17 +20,20 @@ except ImportError:
     print("Warning: Custom CUDA implementation not available. Run `python setup.py install` first.")
 
 # Try to import Triton implementation
+HAS_TRITON = False
+try:
+    from triton_flash_attn import triton_flash_attention
+    HAS_TRITON = True
+except ImportError:
+    pass
+
+# Try to import xformers
+HAS_XFORMERS = False
 try:
     from xformers.ops import memory_efficient_attention
     HAS_XFORMERS = True
 except ImportError:
-    HAS_XFORMERS = False
-    # Try triton_flash_attention
-    try:
-        from triton_flash_attention import flash_attention
-        HAS_TRITON = True
-    except ImportError:
-        HAS_TRITON = False
+    pass
 
 
 class FlashAttentionFunction(torch.autograd.Function):
@@ -253,6 +256,31 @@ def benchmark_attention(
             compare_results = compare_outputs(out_xformers, out_custom, "xformers", "Custom")
             results["xformers"]["vs_custom"] = compare_results
 
+    # Benchmark Triton
+    if HAS_TRITON:
+        for _ in range(num_warmup):
+            _ = triton_flash_attention(Q, K, V)
+        torch.cuda.synchronize()
+
+        times = []
+        for _ in range(num_runs):
+            start = time.perf_counter()
+            out_triton = triton_flash_attention(Q, K, V)
+            torch.cuda.synchronize()
+            end = time.perf_counter()
+            times.append(end - start)
+
+        results["triton"] = {
+            "mean_time_ms": np.mean(times) * 1000,
+            "std_time_ms": np.std(times) * 1000,
+            "min_time_ms": np.min(times) * 1000,
+            "max_time_ms": np.max(times) * 1000,
+        }
+
+        if use_pytorch:
+            compare_results = compare_outputs(out_triton, out_pytorch, "Triton", "PyTorch")
+            results["triton"]["vs_pytorch"] = compare_results
+
     return results
 
 
@@ -338,6 +366,26 @@ def run_correctness_test(
             all_passed = False
     else:
         print("xformers: SKIPPED (not installed)")
+
+    # Test Triton
+    if HAS_TRITON:
+        try:
+            triton_out = triton_flash_attention(Q, K, V)
+            if reference is not None:
+                comp = compare_outputs(triton_out, reference, "Triton", "PyTorch")
+                passed = comp["max_abs_diff"] < tolerance
+                if passed:
+                    print(f"Triton: PASS (max_diff={comp['max_abs_diff']:.6f})")
+                else:
+                    print(f"Triton: FAIL (max_diff={comp['max_abs_diff']:.6f})")
+                    all_passed = False
+            else:
+                print("Triton: OK (no reference)")
+        except Exception as e:
+            print(f"Triton: ERROR ({e})")
+            all_passed = False
+    else:
+        print("Triton: SKIPPED (not installed)")
 
     return all_passed
 

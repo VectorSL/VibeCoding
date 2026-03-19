@@ -23,6 +23,7 @@ from attention import (
     benchmark_attention,
     HAS_CUSTOM_CUDA,
     HAS_XFORMERS,
+    HAS_TRITON,
 )
 
 
@@ -63,6 +64,7 @@ def main():
         print(f"CUDA device: {torch.cuda.get_device_name(0)}")
         print(f"PyTorch version: {torch.__version__}")
     print(f"Custom CUDA available: {HAS_CUSTOM_CUDA}")
+    print(f"Triton available: {HAS_TRITON}")
     print(f"xformers available: {HAS_XFORMERS}")
     print("="*60)
 
