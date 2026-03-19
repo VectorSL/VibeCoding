@@ -327,6 +327,24 @@ Triton 实现：~100 行 Python，使用 tl.dot 自动利用 Tensor Core。
 
 ---
 
+## Round 33: ncu 分析驱动的 smem 优化 (2026-03-19)
+
+**profiling 发现**: occupancy 仅 8.3%（1 block/SM），shared memory 28KB 是瓶颈。
+
+**优化**: K/V 共用 buffer + S_float 复用 KV 空间，smem 从 28KB 降到 16KB。
+- WMMA 计算 QK^T 后 sync，然后将结果写入 KV_tile 区域（K 已不需要）
+- softmax 完成后加载 V 到 KV_tile
+- occupancy: 8.3% → 16.7% (1 → 2 blocks/SM)
+
+| Config | Round 26 (28KB) | Round 33 (16KB) | 提升 |
+|--------|----------------|----------------|------|
+| 1,8,512,512,64 | 0.219ms | 0.212ms | 3% |
+| 1,8,1024,1024,64 | 0.830ms | 0.576ms | 31% |
+| 1,16,2048,2048,64 | 4.479ms | 4.356ms | 3% |
+| 4,16,4096,4096,64 | 68.379ms | 66.567ms | 3% |
+
+---
+
 ## 使用方法
 
 1. **编译**:
