@@ -132,6 +132,19 @@
 
 ---
 
+## Round 13: WMMA Tensor Core 加速 QK^T (2026-03-19)
+- **测试配置**: B=1, H=8, N=512, M=512, D=64
+- **优化项**: 使用 CUDA WMMA (16x16x16) 计算 QK^T 矩阵乘法
+- **改动内容**:
+  - 引入 mma.h，使用 wmma::mma_sync 做 half 精度矩阵乘
+  - 16 Q rows × 16 KV positions 一次 WMMA 计算
+  - D=64 拆成 4 个 WMMA_K=16 的 tile
+  - 4 warps: warp 0 做 WMMA，所有 warps 并行做 softmax + V 累加
+- **性能变化**: 2.14ms → 1.32ms
+- **结论**: ✅ 有效，提升38% (累计 87ms → 1.32ms, 65.9x)
+
+---
+
 ## 使用方法
 
 1. **编译**:
