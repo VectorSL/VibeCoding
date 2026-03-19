@@ -115,37 +115,103 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         }
         __syncthreads();
 
-        // Step 2: Online softmax + produce P_half
-        for (int qi = tid; qi < q_rows; qi += THREADS) {
-            float old_max = max_vals[qi];
-            float old_sum = sum_vals[qi];
+        // Step 2: Online softmax + produce P_half (parallelized)
 
-            float row_max = old_max;
-            for (int kj = 0; kj < kv_len; kj++) {
-                float s = S_float[qi * BLOCK_KV + kj] * p.softmax_scale;
-                S_float[qi * BLOCK_KV + kj] = s;
-                row_max = fmaxf(row_max, s);
+        // 2a: Apply scale to all scores in parallel
+        for (int j = tid; j < BLOCK_Q * BLOCK_KV; j += THREADS) {
+            int qi = j / BLOCK_KV;
+            int kj = j % BLOCK_KV;
+            if (qi < q_rows && kj < kv_len) {
+                S_float[j] *= p.softmax_scale;
             }
+        }
+        __syncthreads();
 
-            float exp_correction = __expf(old_max - row_max);
-            float new_sum = old_sum * exp_correction;
+        // 2b: Find row max - use shared memory for partial maxes
+        // Each of 16 Q rows needs a max over 64 KV positions
+        // Use 4 threads per row (16 KV each), then reduce
+        __shared__ float row_max_partial[BLOCK_Q * 4];
+        {
+            // 4 threads per Q row, each handles 16 KV positions
+            const int threads_per_row = 4;
+            const int total_jobs = BLOCK_Q * threads_per_row;  // 64
+            for (int job = tid; job < total_jobs; job += THREADS) {
+                int qi = job / threads_per_row;
+                int chunk = job % threads_per_row;
+                int kj_start = chunk * (BLOCK_KV / threads_per_row);
+                int kj_end = kj_start + (BLOCK_KV / threads_per_row);
 
-            for (int kj = 0; kj < kv_len; kj++) {
-                float exp_s = __expf(S_float[qi * BLOCK_KV + kj] - row_max);
-                P_half[qi * BLOCK_KV + kj] = __float2half(exp_s);
-                new_sum += exp_s;
+                float local_max = NEG_INF;
+                if (qi < q_rows) {
+                    for (int kj = kj_start; kj < kj_end && kj < kv_len; kj++) {
+                        local_max = fmaxf(local_max, S_float[qi * BLOCK_KV + kj]);
+                    }
+                }
+                row_max_partial[qi * threads_per_row + chunk] = local_max;
             }
-            for (int kj = kv_len; kj < BLOCK_KV; kj++) {
-                P_half[qi * BLOCK_KV + kj] = __float2half(0.0f);
-            }
+        }
+        __syncthreads();
 
-            // Rescale O_acc
-            for (int d = 0; d < D; d++) {
-                O_acc[qi * D + d] *= exp_correction;
-            }
+        // Reduce partial maxes and compute exp_correction
+        __shared__ float exp_corr[BLOCK_Q];
+        if (tid < BLOCK_Q && tid < q_rows) {
+            float row_max = row_max_partial[tid * 4];
+            row_max = fmaxf(row_max, row_max_partial[tid * 4 + 1]);
+            row_max = fmaxf(row_max, row_max_partial[tid * 4 + 2]);
+            row_max = fmaxf(row_max, row_max_partial[tid * 4 + 3]);
+            row_max = fmaxf(row_max, max_vals[tid]);
 
-            max_vals[qi] = row_max;
-            sum_vals[qi] = new_sum;
+            exp_corr[tid] = __expf(max_vals[tid] - row_max);
+            max_vals[tid] = row_max;
+        }
+        __syncthreads();
+
+        // 2c: Compute exp(score - max) and store as P_half, in parallel
+        for (int j = tid; j < BLOCK_Q * BLOCK_KV; j += THREADS) {
+            int qi = j / BLOCK_KV;
+            int kj = j % BLOCK_KV;
+            if (qi < q_rows && kj < kv_len) {
+                P_half[j] = __float2half(__expf(S_float[j] - max_vals[qi]));
+            } else {
+                P_half[j] = __float2half(0.0f);
+            }
+        }
+        __syncthreads();
+
+        // 2d: Compute row sums of P in parallel (same 4-thread-per-row pattern)
+        __shared__ float row_sum_partial[BLOCK_Q * 4];
+        {
+            const int threads_per_row = 4;
+            const int total_jobs = BLOCK_Q * threads_per_row;
+            for (int job = tid; job < total_jobs; job += THREADS) {
+                int qi = job / threads_per_row;
+                int chunk = job % threads_per_row;
+                int kj_start = chunk * (BLOCK_KV / threads_per_row);
+                int kj_end = kj_start + (BLOCK_KV / threads_per_row);
+
+                float local_sum = 0.0f;
+                if (qi < q_rows) {
+                    for (int kj = kj_start; kj < kj_end && kj < kv_len; kj++) {
+                        local_sum += __half2float(P_half[qi * BLOCK_KV + kj]);
+                    }
+                }
+                row_sum_partial[qi * threads_per_row + chunk] = local_sum;
+            }
+        }
+        __syncthreads();
+
+        // Reduce partial sums and update sum_vals
+        if (tid < BLOCK_Q && tid < q_rows) {
+            float psum = row_sum_partial[tid * 4] + row_sum_partial[tid * 4 + 1]
+                       + row_sum_partial[tid * 4 + 2] + row_sum_partial[tid * 4 + 3];
+            sum_vals[tid] = sum_vals[tid] * exp_corr[tid] + psum;
+        }
+        __syncthreads();
+
+        // 2e: Rescale O_acc in parallel
+        for (int j = tid; j < q_rows * D; j += THREADS) {
+            int qi = j / D;
+            O_acc[j] *= exp_corr[qi];
         }
         __syncthreads();
 
