@@ -24,6 +24,31 @@
 
 ---
 
+## Round 1: 优化尝试 (2026-03-19)
+- **测试配置**: B=1, H=8, N=512, M=512, D=64
+- **PyTorch参考**: 0.05ms
+
+| 优化项 | 改动 | 性能 | 结论 |
+|--------|------|------|------|
+| Baseline | 简单kernel | 87-89ms | 基准 |
+| THREADS=256 | 增加threads | 165ms | ❌ 更慢 |
+| THREADS=128 + constant memory | 使用常量内存 | 166ms | ❌ 更慢 |
+| BLOCK_N=96 | 增大block | FAILED | ❌ shared memory过大 |
+| BLOCK_N=128 | 增大block | FAILED | ❌ shared memory过大 |
+| #pragma unroll 8 | 循环展开 | 164ms | ❌ 更慢 |
+| Double buffering | 预取优化 | FAILED | ❌ shared memory过大 |
+| Warp级并行 | 多Q行处理 | 119ms | ❌ 更慢 |
+| Vectorized loads | float2向量化 | 88ms | ➖ 差不多 |
+
+**最终结论**: 最佳性能 ~87ms，PyTorch ~0.05ms (差距1700x)
+
+**原因分析**:
+- PyTorch使用CUDA Tensor Cores进行矩阵乘法加速
+- PyTorch使用深度内核融合减少内存带宽
+- 手写CUDA难以达到同样优化级别
+
+---
+
 ## 使用方法
 
 1. **编译**:
