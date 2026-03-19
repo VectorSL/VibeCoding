@@ -80,16 +80,35 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         const int kv_start = kv_block * BLOCK_KV;
         const int kv_len = min(BLOCK_KV, p.M - kv_start);
 
-        // Load K and V tiles
-        for (int j = tid; j < BLOCK_KV * D; j += THREADS) {
-            int ki = j / D;
-            int dk = j % D;
-            if (ki < kv_len) {
-                K_tile[ki * D + dk] = p.K[k_base + (kv_start + ki) * D + dk];
-                V_tile[ki * D + dk] = p.V[k_base + (kv_start + ki) * D + dk];
+        // Load K and V tiles (vectorized with float4 = 8 halfs at a time)
+        {
+            const int total_halfs = BLOCK_KV * D;
+            const int total_vec = total_halfs / 8;  // float4 = 8 halfs
+            float4* K_vec = reinterpret_cast<float4*>(K_tile);
+            float4* V_vec = reinterpret_cast<float4*>(V_tile);
+            const float4* K_src = reinterpret_cast<const float4*>(p.K + k_base + kv_start * D);
+            const float4* V_src = reinterpret_cast<const float4*>(p.V + k_base + kv_start * D);
+            const float4 zero4 = {0.0f, 0.0f, 0.0f, 0.0f};
+
+            if (kv_len == BLOCK_KV) {
+                // Full tile - no bounds checking needed
+                for (int i = tid; i < total_vec; i += THREADS) {
+                    K_vec[i] = K_src[i];
+                    V_vec[i] = V_src[i];
+                }
             } else {
-                K_tile[ki * D + dk] = __float2half(0.0f);
-                V_tile[ki * D + dk] = __float2half(0.0f);
+                // Partial tile
+                for (int j = tid; j < BLOCK_KV * D; j += THREADS) {
+                    int ki = j / D;
+                    int dk = j % D;
+                    if (ki < kv_len) {
+                        K_tile[ki * D + dk] = p.K[k_base + (kv_start + ki) * D + dk];
+                        V_tile[ki * D + dk] = p.V[k_base + (kv_start + ki) * D + dk];
+                    } else {
+                        K_tile[ki * D + dk] = __float2half(0.0f);
+                        V_tile[ki * D + dk] = __float2half(0.0f);
+                    }
+                }
             }
         }
         __syncthreads();
@@ -154,23 +173,11 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         }
         __syncthreads();
 
-        // 2c: Compute exp(score - max) and store as P_half, in parallel
-        for (int j = tid; j < BLOCK_Q * BLOCK_KV; j += THREADS) {
-            int qi = j / BLOCK_KV;
-            int kj = j % BLOCK_KV;
-            if (qi < q_rows && kj < kv_len) {
-                P_half[j] = __float2half(__expf(S_float[j] - max_vals[qi]));
-            } else {
-                P_half[j] = __float2half(0.0f);
-            }
-        }
-        __syncthreads();
-
-        // 2d: Row sums + update sum_vals (parallel reduce)
+        // 2c: Compute exp + P_half + row sums in ONE pass (merged)
         __shared__ float row_sum_partial[BLOCK_Q * 4];
         {
             const int threads_per_row = 4;
-            const int total_jobs = BLOCK_Q * threads_per_row;
+            const int total_jobs = BLOCK_Q * threads_per_row;  // 64
             for (int job = tid; job < total_jobs; job += THREADS) {
                 int qi = job / threads_per_row;
                 int chunk = job % threads_per_row;
@@ -179,8 +186,19 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
 
                 float local_sum = 0.0f;
                 if (qi < q_rows) {
-                    for (int kj = kj_start; kj < kj_end && kj < kv_len; kj++) {
-                        local_sum += __half2float(P_half[qi * BLOCK_KV + kj]);
+                    float rm = max_vals[qi];
+                    for (int kj = kj_start; kj < kj_end; kj++) {
+                        if (kj < kv_len) {
+                            float ev = __expf(S_float[qi * BLOCK_KV + kj] - rm);
+                            P_half[qi * BLOCK_KV + kj] = __float2half(ev);
+                            local_sum += ev;
+                        } else {
+                            P_half[qi * BLOCK_KV + kj] = __float2half(0.0f);
+                        }
+                    }
+                } else {
+                    for (int kj = kj_start; kj < kj_end; kj++) {
+                        P_half[qi * BLOCK_KV + kj] = __float2half(0.0f);
                     }
                 }
                 row_sum_partial[qi * threads_per_row + chunk] = local_sum;
@@ -188,7 +206,7 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         }
         __syncthreads();
 
-        // 2e: Reduce sums + rescale O_acc (merged, saves 1 sync)
+        // 2d: Reduce sums + rescale O_acc (merged)
         if (tid < BLOCK_Q && tid < q_rows) {
             float psum = row_sum_partial[tid * 4] + row_sum_partial[tid * 4 + 1]
                        + row_sum_partial[tid * 4 + 2] + row_sum_partial[tid * 4 + 3];

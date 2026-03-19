@@ -234,6 +234,22 @@
 
 ---
 
+## Round 23-24: sync 合并 + vectorized load (2026-03-19)
+
+| Round | 优化项 | 性能 | 结论 |
+|-------|--------|------|------|
+| 23 | K/V 共用 shared memory | 0.345ms | ❌ 多一次 V 加载 sync 抵消 |
+| 24a | 合并 exp+sum 步骤 | 0.342ms | ➖ 持平 |
+| 24b | float4 vectorized K/V load | 0.259ms | ✅ 提升16% |
+
+**Round 24b 详情**:
+- 全 tile 时用 float4 (128-bit) 向量化加载 K 和 V
+- 每次 float4 加载 8 个 half 值
+- 减少 global memory 事务数量
+- **性能变化**: 0.31ms → 0.26ms (累计 87ms → 0.26ms, 334.6x)
+
+---
+
 ## 使用方法
 
 1. **编译**:
