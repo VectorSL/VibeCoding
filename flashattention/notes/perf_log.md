@@ -158,6 +158,20 @@
 
 ---
 
+## Round 16: WMMA for both QK^T and PV (2026-03-19)
+- **测试配置**: B=1, H=8, N=512, M=512, D=64
+- **优化项**: P×V 矩阵乘法也用 WMMA Tensor Core
+- **改动内容**:
+  - Step 1: WMMA 计算 S = Q @ K^T (16x16)
+  - Step 2: 标量 online softmax，生成 P_half (16x16)
+  - Step 3: WMMA 计算 O_tile = P @ V (16xD，D 拆成 16-wide tiles，4 warps 并行)
+  - Step 4: 标量 rescale running O accumulator
+  - O_acc 和 softmax 状态存在 shared memory
+- **性能变化**: 1.32ms → 0.76ms
+- **结论**: ✅ 大幅提升42% (累计 87ms → 0.76ms, 114.5x)
+
+---
+
 ## 使用方法
 
 1. **编译**:
