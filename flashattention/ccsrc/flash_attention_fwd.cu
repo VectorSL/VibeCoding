@@ -6,13 +6,12 @@
 #include <mma.h>
 #include <algorithm>
 
-// FlashAttention v2 - Round 33: Aggressive smem reduction for higher occupancy
-// Target: ~16KB smem -> 3 blocks/SM (from 28KB -> 1 block/SM)
+// FlashAttention v2 - Round 34: Register-cached softmax + eliminated S_float_tmp reads
+// Based on Round 33 (best: 0.212ms/512, 0.576ms/1024)
 // Changes:
-// 1. K/V share same buffer (load K, compute QK^T, then load V for PV)
-// 2. S stored as half (not float) - saves 2KB
-// 3. S and P share same buffer (compute S, convert to P in-place)
-// 4. Q loaded from global memory each tile (saves 2KB smem)
+// 1. Cache scaled values in registers during softmax (avoid re-reading S_float_tmp)
+// 2. Remove exp_corr shared array - use per-row shared broadcast (saves 64B, 1 fewer smem array)
+// 3. Eliminate one sync by having softmax threads also do O_acc rescale for their rows
 
 using namespace nvcuda;
 
@@ -68,17 +67,17 @@ __global__ __launch_bounds__(128, 2) void flash_attention_fwd_kernel(const Flash
 
     const int sm_qi = warp_id * 4 + lane_id / 8;
     const int sm_chunk = lane_id % 8;
-    const int kv_per_thread = BLOCK_KV / 8;
+    const int kv_per_thread = BLOCK_KV / 8;  // = 8
 
-    // Shared memory layout (aggressive reduction):
-    // KV_tile: 64*64*2 = 8192 (shared K/V)
-    // S_P_half: 16*64*2 = 2048 (shared S/P as half)
+    // Shared memory layout:
+    // Q_tile: 16*64*2 = 2048
+    // KV_tile: 64*64*2 = 8192 (K/V shared, also S_float_tmp overlay)
+    // S_P_half: 16*64*2 = 2048
     // O_acc: 16*64*4 = 4096
     // max_vals: 16*4 = 64
     // sum_vals: 16*4 = 64
     // exp_corr: 16*4 = 64
-    // Q_tile: 16*64*2 = 2048 (keep Q in smem, reload is expensive)
-    // Total: 16576 bytes = 16.2 KB -> 2 blocks/SM (maybe 3 with register tuning)
+    // Total: 16576 bytes = 16.2 KB -> 2 blocks/SM
 
     extern __shared__ char smem_raw[];
     half* Q_tile = reinterpret_cast<half*>(smem_raw);
@@ -88,8 +87,6 @@ __global__ __launch_bounds__(128, 2) void flash_attention_fwd_kernel(const Flash
     float* max_vals = O_acc + BLOCK_Q * D;
     float* sum_vals = max_vals + BLOCK_Q;
     float* exp_corr = sum_vals + BLOCK_Q;
-    // Temp float buffer for softmax (reuse part of KV_tile after QK^T, before V load)
-    // We need 16*64 floats = 4096 bytes, KV_tile is 8192 bytes - fits!
     float* S_float_tmp = reinterpret_cast<float*>(KV_tile);
 
     // Load Q tile
@@ -133,11 +130,9 @@ __global__ __launch_bounds__(128, 2) void flash_attention_fwd_kernel(const Flash
                 }
             }
         }
-        __syncthreads();
+        __syncthreads(); // sync 1: K loaded
 
         // Step 1: WMMA QK^T
-        // Each warp computes its 16x16 tile of QK^T, result stays in acc_frag (registers)
-        // After sync (all warps done reading K), store to S_float_tmp (overlaps KV_tile)
         wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> qk_acc;
         {
             const int kv_offset = warp_id * WMMA_N;
@@ -152,24 +147,29 @@ __global__ __launch_bounds__(128, 2) void flash_attention_fwd_kernel(const Flash
                 wmma::mma_sync(qk_acc, a_frag, b_frag, qk_acc);
             }
         }
-        // All warps done reading K from KV_tile
-        __syncthreads();
-        // Now safe to overwrite KV_tile with S_float_tmp
+        __syncthreads(); // sync 2: all warps done reading K
         {
             const int kv_offset = warp_id * WMMA_N;
             wmma::store_matrix_sync(S_float_tmp + kv_offset, qk_acc, BLOCK_KV, wmma::mem_row_major);
         }
-        __syncthreads();
+        __syncthreads(); // sync 3: S_float_tmp ready
 
-        // Step 2: Online softmax (using S_float_tmp which now overlaps KV_tile)
+        // Step 2: Online softmax with register caching
+        // Pass 1: scale + max (cache scaled values in registers)
+        float scaled_vals[8]; // kv_per_thread = 8
         float local_max = NEG_INF;
         if (sm_qi < q_rows) {
-            int kj_start = sm_chunk * kv_per_thread;
-            int kj_end = kj_start + kv_per_thread;
-            for (int kj = kj_start; kj < kj_end && kj < kv_len; kj++) {
-                float s = S_float_tmp[sm_qi * BLOCK_KV + kj] * p.softmax_scale;
-                S_float_tmp[sm_qi * BLOCK_KV + kj] = s;
-                local_max = fmaxf(local_max, s);
+            const int kj_start = sm_chunk * kv_per_thread;
+            #pragma unroll
+            for (int i = 0; i < kv_per_thread; i++) {
+                int kj = kj_start + i;
+                if (kj < kv_len) {
+                    float s = S_float_tmp[sm_qi * BLOCK_KV + kj] * p.softmax_scale;
+                    scaled_vals[i] = s;
+                    local_max = fmaxf(local_max, s);
+                } else {
+                    scaled_vals[i] = NEG_INF;
+                }
             }
         }
         float row_max = warp_reduce_max_8(local_max);
@@ -181,18 +181,18 @@ __global__ __launch_bounds__(128, 2) void flash_attention_fwd_kernel(const Flash
             exp_corr[sm_qi] = ec;
             max_vals[sm_qi] = row_max;
         }
-        __syncthreads();
+        __syncthreads(); // sync 4: exp_corr + max_vals broadcast
         ec = exp_corr[sm_qi];
-        float my_row_max = max_vals[sm_qi];
 
-        // Compute exp and store P as half into S_P_half
+        // Pass 2: exp + sum + write P_half (read from registers, not S_float_tmp)
         float local_sum = 0.0f;
         if (sm_qi < q_rows) {
-            int kj_start = sm_chunk * kv_per_thread;
-            int kj_end = kj_start + kv_per_thread;
-            for (int kj = kj_start; kj < kj_end; kj++) {
+            const int kj_start = sm_chunk * kv_per_thread;
+            #pragma unroll
+            for (int i = 0; i < kv_per_thread; i++) {
+                int kj = kj_start + i;
                 if (kj < kv_len) {
-                    float ev = __expf(S_float_tmp[sm_qi * BLOCK_KV + kj] - my_row_max);
+                    float ev = __expf(scaled_vals[i] - row_max);
                     S_P_half[sm_qi * BLOCK_KV + kj] = __float2half(ev);
                     local_sum += ev;
                 } else {
@@ -211,9 +211,9 @@ __global__ __launch_bounds__(128, 2) void flash_attention_fwd_kernel(const Flash
             int qi = j / D;
             O_acc[j] *= exp_corr[qi];
         }
-        __syncthreads();
+        __syncthreads(); // sync 5: O_acc rescaled, KV_tile free for V
 
-        // Load V tile into KV_tile (S_float_tmp is no longer needed, KV_tile is free)
+        // Load V tile into KV_tile
         {
             const int total_halfs = BLOCK_KV * D;
             const int total_vec = total_halfs / 8;
@@ -231,7 +231,7 @@ __global__ __launch_bounds__(128, 2) void flash_attention_fwd_kernel(const Flash
                 }
             }
         }
-        __syncthreads();
+        __syncthreads(); // sync 6: V loaded
 
         // Step 3: WMMA P @ V
         for (int dt = warp_id; dt < d_tiles; dt += NUM_WARPS) {
@@ -249,7 +249,7 @@ __global__ __launch_bounds__(128, 2) void flash_attention_fwd_kernel(const Flash
 
             wmma::store_matrix_sync(O_acc + dt * WMMA_N, pv_acc, D, wmma::mem_row_major);
         }
-        __syncthreads();
+        __syncthreads(); // sync 7: PV done
     }
 
     // Write final output
@@ -288,10 +288,8 @@ torch::Tensor flash_attention_fwd(torch::Tensor Q, torch::Tensor K, torch::Tenso
     dim3 grid(grid_q, H, B);
     dim3 block(THREADS);
 
-    // Shared memory: Q(2KB) + KV(8KB) + S_P_half(2KB) + O_acc(4KB) + misc(192B) = ~16.2KB
-    // S_float_tmp overlaps KV_tile (reused after K is consumed)
     size_t shared_mem = BLOCK_Q * D * sizeof(half)              // Q_tile
-                      + BLOCK_KV * D * sizeof(half)             // KV_tile (also S_float_tmp)
+                      + BLOCK_KV * D * sizeof(half)             // KV_tile
                       + BLOCK_Q * BLOCK_KV * sizeof(half)       // S_P_half
                       + BLOCK_Q * D * sizeof(float)             // O_acc
                       + 3 * BLOCK_Q * sizeof(float);            // max_vals, sum_vals, exp_corr

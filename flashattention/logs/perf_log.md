@@ -345,6 +345,25 @@ Triton 实现：~100 行 Python，使用 tl.dot 自动利用 Tensor Core。
 
 ---
 
+## Round 34: Register-cached softmax (2026-03-19)
+- **测试配置**: B=1, H=8, N=512/1024, M=512/1024, D=64
+- **优化项**: softmax 中间值缓存到寄存器，避免 exp 阶段重读 S_float_tmp
+- **改动内容**:
+  - scale+max pass 中将 scaled 值存入寄存器数组 `scaled_vals[8]`
+  - exp+sum pass 直接从寄存器读取，不再访问 S_float_tmp (shared memory)
+  - 减少 shared memory 带宽压力
+- **性能变化**:
+
+| Config | Round 33 | Round 34 | 提升 |
+|--------|----------|----------|------|
+| 1,8,512,512,64 | 0.212ms | 0.179ms | 16% |
+| 1,8,1024,1024,64 | 0.576ms | 0.490ms | 15% |
+
+- **结论**: ✅ 有效 (累计 87ms → 0.179ms, 486x)
+- **vs PyTorch**: 0.056ms, 差距 ~3.2x
+
+---
+
 ## 使用方法
 
 1. **编译**:
