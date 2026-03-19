@@ -116,22 +116,9 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
 
         // Step 2: Online softmax + produce P_half (parallelized)
 
-        // 2a: Apply scale to all scores in parallel
-        for (int j = tid; j < BLOCK_Q * BLOCK_KV; j += THREADS) {
-            int qi = j / BLOCK_KV;
-            int kj = j % BLOCK_KV;
-            if (qi < q_rows && kj < kv_len) {
-                S_float[j] *= p.softmax_scale;
-            }
-        }
-        __syncthreads();
-
-        // 2b: Find row max - use shared memory for partial maxes
-        // Each of 16 Q rows needs a max over 64 KV positions
-        // Use 4 threads per row (16 KV each), then reduce
+        // 2a: Scale + find row max in ONE pass (merged, saves 1 sync)
         __shared__ float row_max_partial[BLOCK_Q * 4];
         {
-            // 4 threads per Q row, each handles 16 KV positions
             const int threads_per_row = 4;
             const int total_jobs = BLOCK_Q * threads_per_row;  // 64
             for (int job = tid; job < total_jobs; job += THREADS) {
@@ -143,7 +130,9 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
                 float local_max = NEG_INF;
                 if (qi < q_rows) {
                     for (int kj = kj_start; kj < kj_end && kj < kv_len; kj++) {
-                        local_max = fmaxf(local_max, S_float[qi * BLOCK_KV + kj]);
+                        float s = S_float[qi * BLOCK_KV + kj] * p.softmax_scale;
+                        S_float[qi * BLOCK_KV + kj] = s;
+                        local_max = fmaxf(local_max, s);
                     }
                 }
                 row_max_partial[qi * threads_per_row + chunk] = local_max;
@@ -151,7 +140,7 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         }
         __syncthreads();
 
-        // Reduce partial maxes and compute exp_correction
+        // 2b: Reduce partial maxes and compute exp_correction
         __shared__ float exp_corr[BLOCK_Q];
         if (tid < BLOCK_Q && tid < q_rows) {
             float row_max = row_max_partial[tid * 4];
@@ -177,7 +166,7 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         }
         __syncthreads();
 
-        // 2d: Compute row sums of P in parallel (same 4-thread-per-row pattern)
+        // 2d: Row sums + update sum_vals (parallel reduce)
         __shared__ float row_sum_partial[BLOCK_Q * 4];
         {
             const int threads_per_row = 4;
@@ -199,15 +188,12 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         }
         __syncthreads();
 
-        // Reduce partial sums and update sum_vals
+        // 2e: Reduce sums + rescale O_acc (merged, saves 1 sync)
         if (tid < BLOCK_Q && tid < q_rows) {
             float psum = row_sum_partial[tid * 4] + row_sum_partial[tid * 4 + 1]
                        + row_sum_partial[tid * 4 + 2] + row_sum_partial[tid * 4 + 3];
             sum_vals[tid] = sum_vals[tid] * exp_corr[tid] + psum;
         }
-        __syncthreads();
-
-        // 2e: Rescale O_acc in parallel
         for (int j = tid; j < q_rows * D; j += THREADS) {
             int qi = j / D;
             O_acc[j] *= exp_corr[qi];

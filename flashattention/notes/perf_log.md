@@ -222,6 +222,18 @@
 
 ---
 
+## Round 21-22: 无效尝试 (2026-03-19)
+
+| Round | 优化项 | 性能 | 结论 |
+|-------|--------|------|------|
+| 21 | 8 warps + BLOCK_KV=128 | 0.39ms | ❌ shared memory 超限，occupancy 下降 |
+| 22a | S_float/P_half 共享内存 | FAIL | ❌ 数据损坏，正确性失败 |
+| 22b | 合并 scale+max, sum+rescale syncs | 0.33ms | ➖ 持平 |
+
+**当前最佳**: Round 20, 0.31ms (87ms → 0.31ms, 280.6x)
+
+---
+
 ## 使用方法
 
 1. **编译**:
