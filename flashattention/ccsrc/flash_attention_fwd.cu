@@ -53,7 +53,7 @@ __device__ __forceinline__ float warp_reduce_sum_8(float val) {
     return val;
 }
 
-__global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
+__global__ __launch_bounds__(128, 2) void flash_attention_fwd_kernel(const FlashAttentionParams p) {
     const int batch_idx = blockIdx.z;
     const int head_idx = blockIdx.y;
     const int q_block_start = blockIdx.x * BLOCK_Q;
