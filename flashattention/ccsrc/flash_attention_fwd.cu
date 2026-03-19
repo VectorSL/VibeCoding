@@ -53,8 +53,7 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
     half* V_tile = K_tile + BLOCK_KV * D;
     float* S_float = reinterpret_cast<float*>(V_tile + BLOCK_KV * D);
     half* P_half = reinterpret_cast<half*>(S_float + BLOCK_Q * BLOCK_KV);
-    float* O_tile = reinterpret_cast<float*>(P_half + BLOCK_Q * BLOCK_KV);
-    float* max_vals = O_tile + BLOCK_Q * D;
+    float* max_vals = reinterpret_cast<float*>(P_half + BLOCK_Q * BLOCK_KV);
     float* sum_vals = max_vals + BLOCK_Q;
     float* O_acc = sum_vals + BLOCK_Q;
 
@@ -215,12 +214,13 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         }
         __syncthreads();
 
-        // Step 3: WMMA P @ V -> O_tile[16xD]
+        // Step 3: WMMA P @ V -> directly into O_acc
         // P[16x64] @ V[64xD]: split into D-tiles of 16
-        // For each D-tile: accumulate over 4 K-tiles of 16
+        // Load O_acc into accumulator, WMMA adds PV on top, store back
         for (int dt = warp_id; dt < d_tiles; dt += NUM_WARPS) {
             wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> pv_acc;
-            wmma::fill_fragment(pv_acc, 0.0f);
+            // Initialize accumulator with current O_acc values
+            wmma::load_matrix_sync(pv_acc, O_acc + dt * WMMA_N, D, wmma::mem_row_major);
 
             #pragma unroll
             for (int kt = 0; kt < 4; kt++) {
@@ -231,13 +231,7 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
                 wmma::mma_sync(pv_acc, p_frag, v_frag, pv_acc);
             }
 
-            wmma::store_matrix_sync(O_tile + dt * WMMA_N, pv_acc, D, wmma::mem_row_major);
-        }
-        __syncthreads();
-
-        // Step 4: Add O_tile to O_acc
-        for (int j = tid; j < q_rows * D; j += THREADS) {
-            O_acc[j] += O_tile[j];
+            wmma::store_matrix_sync(O_acc + dt * WMMA_N, pv_acc, D, wmma::mem_row_major);
         }
         __syncthreads();
     }
@@ -281,9 +275,9 @@ torch::Tensor flash_attention_fwd(torch::Tensor Q, torch::Tensor K, torch::Tenso
     size_t shared_mem = (BLOCK_Q * D + BLOCK_KV * D + BLOCK_KV * D) * sizeof(half)
                       + BLOCK_Q * BLOCK_KV * sizeof(float)
                       + BLOCK_Q * BLOCK_KV * sizeof(half)
-                      + BLOCK_Q * D * sizeof(float)
                       + 2 * BLOCK_Q * sizeof(float)
-                      + BLOCK_Q * D * sizeof(float);
+                      + BLOCK_Q * D * sizeof(float)
+                      + BLOCK_Q * 4 * sizeof(float) * 2;  // row_max_partial + row_sum_partial
 
     flash_attention_fwd_kernel<<<grid, block, shared_mem, at::cuda::getCurrentCUDAStream()>>>(params);
     cudaError_t err = cudaGetLastError();

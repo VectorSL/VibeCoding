@@ -209,6 +209,19 @@
 
 ---
 
+## Round 20: 消除 O_tile，WMMA 直接累加到 O_acc (2026-03-19)
+- **测试配置**: B=1, H=8, N=512, M=512, D=64
+- **优化项**: PV WMMA 直接累加到 O_acc，省掉 O_tile 和 add 步骤
+- **改动内容**:
+  - WMMA accumulator 用 load_matrix_sync 从 O_acc 初始化
+  - WMMA mma_sync 直接累加 PV 结果
+  - store_matrix_sync 写回 O_acc
+  - 省掉 O_tile shared memory (4KB) 和一次 syncthreads + add
+- **性能变化**: 0.41ms → 0.31ms
+- **结论**: ✅ 大幅提升25% (累计 87ms → 0.31ms, 280.6x)
+
+---
+
 ## 使用方法
 
 1. **编译**:
