@@ -262,6 +262,19 @@
 
 ---
 
+## Round 26-28: 三大优化方向尝试 (2026-03-19)
+
+| Round | 优化项 | 性能 | 结论 |
+|-------|--------|------|------|
+| 26 | Warp shuffle softmax reduce | 0.219ms | ✅ 省1KB smem，性能持平 |
+| 27 | Double buffer K (cp.async prefetch) | 0.306ms | ❌ smem增加降低occupancy |
+| 28 | K/V共用smem (20KB) | 0.232ms | ❌ 多一次V加载+sync抵消occupancy提升 |
+
+**当前最佳**: Round 26, 0.219ms (87ms → 0.22ms, 395.5x)
+**vs PyTorch**: 0.06ms, 差距 ~3.7x
+
+---
+
 ## 使用方法
 
 1. **编译**:
