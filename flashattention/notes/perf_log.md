@@ -311,6 +311,22 @@ Triton 实现：~100 行 Python，使用 tl.dot 自动利用 Tensor Core。
 
 ---
 
+## Round 31: Triton Autotune 优化 (2026-03-19)
+
+加入 autotune：10 种 BLOCK_Q/BLOCK_KV/num_warps/num_stages 组合自动选择最优。
+
+| Config | PyTorch | Triton (fixed) | Triton (autotune) |
+|--------|---------|---------------|-------------------|
+| 1,8,512,512,64 | 0.059ms | 0.066ms | 0.065ms |
+| 1,8,1024,1024,64 | 0.119ms | 0.163ms | 0.136ms |
+| 1,16,2048,2048,64 | 0.738ms | 0.695ms | 0.705ms |
+| 2,16,2048,2048,64 | 1.609ms | 1.331ms | 1.361ms |
+| 4,16,4096,4096,64 | 13.268ms | 11.044ms | 10.148ms |
+
+**结论**: 大配置上 Triton autotune 比 PyTorch SDPA 快 23%
+
+---
+
 ## 使用方法
 
 1. **编译**:

@@ -10,6 +10,21 @@ import triton.language as tl
 import math
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_Q': 64, 'BLOCK_KV': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_Q': 64, 'BLOCK_KV': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_Q': 64, 'BLOCK_KV': 64}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_Q': 128, 'BLOCK_KV': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_Q': 128, 'BLOCK_KV': 64}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_Q': 128, 'BLOCK_KV': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_Q': 32, 'BLOCK_KV': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_Q': 64, 'BLOCK_KV': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_Q': 64, 'BLOCK_KV': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_Q': 128, 'BLOCK_KV': 128}, num_warps=8, num_stages=2),
+    ],
+    key=['N', 'M', 'D'],
+)
 @triton.jit
 def _flash_attention_fwd_kernel(
     Q_ptr, K_ptr, V_ptr, O_ptr,
@@ -26,7 +41,7 @@ def _flash_attention_fwd_kernel(
     pid_bh = tl.program_id(1)
 
     # Batch and head indices
-    num_heads = stride_qb // stride_qh  # H = stride_qb / stride_qh
+    num_heads = stride_qb // stride_qh
     pid_b = pid_bh // num_heads
     pid_h = pid_bh % num_heads
 
@@ -47,9 +62,9 @@ def _flash_attention_fwd_kernel(
     q = tl.load(q_ptrs, mask=q_mask, other=0.0)
 
     # Initialize accumulators
-    m_i = tl.full([BLOCK_Q], float('-inf'), dtype=tl.float32)  # row max
-    l_i = tl.zeros([BLOCK_Q], dtype=tl.float32)                # row sum
-    o_acc = tl.zeros([BLOCK_Q, BLOCK_D], dtype=tl.float32)     # output accumulator
+    m_i = tl.full([BLOCK_Q], float('-inf'), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_Q], dtype=tl.float32)
+    o_acc = tl.zeros([BLOCK_Q, BLOCK_D], dtype=tl.float32)
 
     # Iterate over KV blocks
     num_kv_blocks = tl.cdiv(M, BLOCK_KV)
@@ -70,7 +85,7 @@ def _flash_attention_fwd_kernel(
         s = tl.where(kv_mask, s, float('-inf'))
 
         # Online softmax: new max
-        m_ij = tl.max(s, axis=1)  # [BLOCK_Q]
+        m_ij = tl.max(s, axis=1)
         m_new = tl.maximum(m_i, m_ij)
 
         # Correction factor
@@ -105,7 +120,7 @@ def _flash_attention_fwd_kernel(
 
 def triton_flash_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
     """
-    Triton Flash Attention forward pass.
+    Triton Flash Attention forward pass with autotune.
 
     Args:
         Q: [B, H, N, D] float16
@@ -126,13 +141,11 @@ def triton_flash_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) ->
 
     softmax_scale = 1.0 / math.sqrt(D)
 
-    # Tile sizes
-    BLOCK_Q = 64
-    BLOCK_KV = 64
     BLOCK_D = triton.next_power_of_2(D)
 
     # Grid: one program per Q block per (batch, head)
-    grid = (triton.cdiv(N, BLOCK_Q), B * H)
+    # BLOCK_Q is determined by autotune
+    grid = lambda meta: (triton.cdiv(N, meta['BLOCK_Q']), B * H)
 
     _flash_attention_fwd_kernel[grid](
         Q, K, V, O,
@@ -141,7 +154,7 @@ def triton_flash_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) ->
         V.stride(0), V.stride(1), V.stride(2), V.stride(3),
         O.stride(0), O.stride(1), O.stride(2), O.stride(3),
         N, M, D,
-        BLOCK_Q=BLOCK_Q, BLOCK_KV=BLOCK_KV, BLOCK_D=BLOCK_D,
+        BLOCK_D=BLOCK_D,
         softmax_scale=softmax_scale,
     )
 
