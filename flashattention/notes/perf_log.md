@@ -145,6 +145,19 @@
 
 ---
 
+## Round 14-15: WMMA 扩展尝试 (2026-03-19)
+
+| Round | 优化项 | 性能 | 结论 |
+|-------|--------|------|------|
+| 14 | 4 warps全做WMMA + WMMA P*V | FAIL/1.80ms | ❌ 正确性失败/更慢 |
+| 15 | 2 warps WMMA + BLOCK_KV=32 | 1.50ms | ❌ 比Round13慢 |
+
+**分析**: Round 13 (1 warp WMMA, BLOCK_KV=16) 是最优配置。增大BLOCK_KV会增加shared memory和scores矩阵大小，V累加遍历更多KV positions，反而更慢。
+
+**当前最佳**: Round 13, 1.32ms (87ms → 1.32ms, 65.9x)
+
+---
+
 ## 使用方法
 
 1. **编译**:

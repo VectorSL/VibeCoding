@@ -6,20 +6,18 @@
 #include <mma.h>
 #include <algorithm>
 
-// FlashAttention v2 - Round 13: WMMA Tensor Core acceleration
-// Use wmma::mma_sync for QK^T dot products.
-// Process 16 Q rows × 16 KV positions at once using 16x16x16 WMMA.
-// D=64: need 4 WMMA ops (each covers 16 of D dimension).
+// FlashAttention v2 - Round 13 (best: 1.32ms)
+// WMMA Tensor Core for QK^T, 1 warp WMMA + 4 warps V accumulation
 
 using namespace nvcuda;
 
 constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
-constexpr int BLOCK_Q = 16;    // Q rows per block (= WMMA_M)
-constexpr int BLOCK_KV = 16;   // KV positions per WMMA tile (= WMMA_N)
+constexpr int BLOCK_Q = 16;
+constexpr int BLOCK_KV = 16;
 constexpr int NUM_WARPS = 4;
-constexpr int THREADS = NUM_WARPS * 32;  // 128
+constexpr int THREADS = NUM_WARPS * 32;
 constexpr float NEG_INF = -1e10f;
 
 struct FlashAttentionParams {
@@ -49,37 +47,30 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
     const int q_base = batch_idx * q_stride + head_idx * p.N * D;
     const int k_base = batch_idx * k_stride + head_idx * p.M * D;
 
-    // Shared memory layout:
-    // Q_tile: BLOCK_Q × D (half)
-    // K_tile: BLOCK_KV × D (half)
-    // V_tile: BLOCK_KV × D (half)
-    // scores: BLOCK_Q × BLOCK_KV (float)
     extern __shared__ char smem_raw[];
     half* Q_tile = reinterpret_cast<half*>(smem_raw);
     half* K_tile = Q_tile + BLOCK_Q * D;
     half* V_tile = K_tile + BLOCK_KV * D;
     float* scores = reinterpret_cast<float*>(V_tile + BLOCK_KV * D);
 
-    // Load Q tile into shared memory
-    for (int j = tid; j < q_rows * D; j += THREADS) {
+    // Load Q tile
+    for (int j = tid; j < BLOCK_Q * D; j += THREADS) {
         int qi = j / D;
         int dk = j % D;
-        Q_tile[qi * D + dk] = p.Q[q_base + (q_block_start + qi) * D + dk];
+        if (qi < q_rows) {
+            Q_tile[qi * D + dk] = p.Q[q_base + (q_block_start + qi) * D + dk];
+        } else {
+            Q_tile[qi * D + dk] = __float2half(0.0f);
+        }
     }
     __syncthreads();
 
-    // Per-Q-row accumulators in registers
-    // Each warp handles a subset of Q rows for output accumulation
-    // Warp i handles Q rows [i*4, i*4+4) (4 rows per warp, 4 warps × 4 = 16)
     const int rows_per_warp = (BLOCK_Q + NUM_WARPS - 1) / NUM_WARPS;
     const int my_q_start = warp_id * rows_per_warp;
-    const int my_q_end = min(my_q_start + rows_per_warp, q_rows);
-
-    // Output accumulators: each lane handles some D dimensions for its Q rows
-    float out_acc[4][4] = {};  // [rows_per_warp][d_per_lane]
-    float max_val[4];
-    float sum_val[4];
     const int d_per_lane = (D + 31) / 32;
+
+    float out_acc[4][4] = {};
+    float max_val[4], sum_val[4];
     for (int i = 0; i < rows_per_warp; i++) {
         max_val[i] = NEG_INF;
         sum_val[i] = 0.0f;
@@ -91,24 +82,21 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
         const int kv_start = kv_block * BLOCK_KV;
         const int kv_len = min(BLOCK_KV, p.M - kv_start);
 
-        // Load K tile
-        for (int j = tid; j < kv_len * D; j += THREADS) {
+        // Load K and V tiles
+        for (int j = tid; j < BLOCK_KV * D; j += THREADS) {
             int ki = j / D;
             int dk = j % D;
-            K_tile[ki * D + dk] = p.K[k_base + (kv_start + ki) * D + dk];
-        }
-        // Load V tile
-        for (int j = tid; j < kv_len * D; j += THREADS) {
-            int vi = j / D;
-            int dv = j % D;
-            V_tile[vi * D + dv] = p.V[k_base + (kv_start + vi) * D + dv];
+            if (ki < kv_len) {
+                K_tile[ki * D + dk] = p.K[k_base + (kv_start + ki) * D + dk];
+                V_tile[ki * D + dk] = p.V[k_base + (kv_start + ki) * D + dk];
+            } else {
+                K_tile[ki * D + dk] = __float2half(0.0f);
+                V_tile[ki * D + dk] = __float2half(0.0f);
+            }
         }
         __syncthreads();
 
-        // Compute QK^T using WMMA: Q_tile[16×D] × K_tile^T[D×16] = scores[16×16]
-        // Split D into chunks of WMMA_K=16
-        // Use warp 0 to compute the WMMA, other warps wait
-
+        // Warp 0 computes QK^T via WMMA
         if (warp_id == 0) {
             wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
             wmma::fill_fragment(acc_frag, 0.0f);
@@ -118,26 +106,21 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
                 wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
                 wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
 
-                // Load Q[16×16] from Q_tile, starting at column dt*16
                 wmma::load_matrix_sync(a_frag, Q_tile + dt * WMMA_K, D);
-                // Load K[16×16] from K_tile, starting at column dt*16 (col_major = K^T)
                 wmma::load_matrix_sync(b_frag, K_tile + dt * WMMA_K, D);
 
                 wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
             }
 
-            // Store scores to shared memory
             wmma::store_matrix_sync(scores, acc_frag, BLOCK_KV, wmma::mem_row_major);
         }
         __syncthreads();
 
-        // Now all warps can read scores[BLOCK_Q][BLOCK_KV]
-        // Each warp processes its assigned Q rows
+        // All warps do softmax + V accumulation
         for (int qi_local = 0; qi_local < rows_per_warp; qi_local++) {
             int qi = my_q_start + qi_local;
             if (qi >= q_rows) break;
 
-            // Process each KV position
             for (int kj = 0; kj < kv_len; kj++) {
                 float score = scores[qi * BLOCK_KV + kj] * p.softmax_scale;
 
@@ -145,7 +128,6 @@ __global__ void flash_attention_fwd_kernel(const FlashAttentionParams p) {
                 float exp_score = __expf(score - new_max);
                 float exp_max = __expf(max_val[qi_local] - new_max);
 
-                // Update output: each lane handles its D dimensions
                 #pragma unroll
                 for (int di = 0; di < d_per_lane; di++) {
                     int d = lane_id + di * 32;
@@ -205,7 +187,6 @@ torch::Tensor flash_attention_fwd(torch::Tensor Q, torch::Tensor K, torch::Tenso
     int grid_q = (N + BLOCK_Q - 1) / BLOCK_Q;
     dim3 grid(grid_q, H, B);
     dim3 block(THREADS);
-    // Q_tile + K_tile + V_tile (half) + scores (float)
     size_t shared_mem = (BLOCK_Q * D + BLOCK_KV * D + BLOCK_KV * D) * sizeof(half)
                       + BLOCK_Q * BLOCK_KV * sizeof(float);
 
